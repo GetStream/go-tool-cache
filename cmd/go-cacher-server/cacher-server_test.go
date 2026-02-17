@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/bradfitz/go-tool-cache/cachers"
+	"github.com/GetStream/go-tool-cache/cachers"
 )
 
 const (

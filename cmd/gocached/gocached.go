@@ -16,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bradfitz/go-tool-cache/gocached"
+	"github.com/GetStream/go-tool-cache/gocached"
 	"github.com/bradfitz/parentdeath"
 	_ "modernc.org/sqlite"
 )

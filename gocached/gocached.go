@@ -60,8 +60,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	ijwt "github.com/bradfitz/go-tool-cache/gocached/internal/jwt"
-	"github.com/bradfitz/go-tool-cache/gocached/logger"
+	ijwt "github.com/GetStream/go-tool-cache/gocached/internal/jwt"
+	"github.com/GetStream/go-tool-cache/gocached/logger"
 	"github.com/pierrec/lz4/v4"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"

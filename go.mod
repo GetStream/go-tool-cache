@@ -1,4 +1,4 @@
-module github.com/bradfitz/go-tool-cache
+module github.com/GetStream/go-tool-cache
 
 go 1.24.0
 

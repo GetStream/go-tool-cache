@@ -15,15 +15,16 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strings"
 	"time"
 
-	"github.com/bradfitz/go-tool-cache/cacheproc"
-	"github.com/bradfitz/go-tool-cache/cachers"
+	"github.com/GetStream/go-tool-cache/cacheproc"
+	"github.com/GetStream/go-tool-cache/cachers"
 )
 
 var (
 	dir        = flag.String("cache-dir", "", "cache directory; empty means automatic")
-	serverBase = flag.String("cache-server", "", "optional cache server HTTP prefix (scheme and authority only); should be low latency. empty means to not use one.")
+	serverBase = flag.String("cache-server", "", "optional cache server HTTP prefix(es), comma-separated (scheme and authority only); should be low latency. empty means to not use one.")
 	verbose    = flag.Bool("verbose", false, "be verbose")
 	gwPort     = flag.Int("gateway-addr-port", 0, "if non-zero, try to use an HTTP server on this port on our machine's gateway IP. If that fails, use local disk instead.")
 	token      = flag.String("access-token", "", "optional access token to use with the cache server")
@@ -81,14 +82,37 @@ func main() {
 	}
 
 	if *serverBase != "" {
-		hc := &cachers.HTTPClient{
-			BaseURL:     *serverBase,
-			Disk:        dc,
-			Verbose:     *verbose,
-			AccessToken: *token,
+		urls := strings.Split(*serverBase, ",")
+		if len(urls) == 1 {
+			// Single server: use existing HTTPClient directly (no regression)
+			hc := &cachers.HTTPClient{
+				BaseURL:     urls[0],
+				Disk:        dc,
+				Verbose:     *verbose,
+				AccessToken: *token,
+			}
+			p.Get = hc.Get
+			p.Put = hc.Put
+		} else {
+			// Multiple servers: use MultiHTTPClient with consistent hashing
+			clients := make([]*cachers.HTTPClient, len(urls))
+			for i, u := range urls {
+				clients[i] = &cachers.HTTPClient{
+					BaseURL:        strings.TrimSpace(u),
+					Disk:           dc,
+					Verbose:        *verbose,
+					AccessToken:    *token,
+					BestEffortHTTP: true,
+				}
+			}
+			mc := &cachers.MultiHTTPClient{
+				Clients: clients,
+				Disk:    dc,
+				Verbose: *verbose,
+			}
+			p.Get = mc.Get
+			p.Put = mc.Put
 		}
-		p.Get = hc.Get
-		p.Put = hc.Put
 	}
 
 	if err := p.Run(); err != nil {

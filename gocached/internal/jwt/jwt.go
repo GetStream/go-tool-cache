@@ -16,7 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/bradfitz/go-tool-cache/gocached/logger"
+	"github.com/GetStream/go-tool-cache/gocached/logger"
 	"github.com/go-jose/go-jose/v4"
 	"github.com/golang-jwt/jwt/v5"
 )

@@ -27,7 +27,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bradfitz/go-tool-cache/cachers"
+	"github.com/GetStream/go-tool-cache/cachers"
 	"github.com/go-jose/go-jose/v4"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/go-cmp/cmp"

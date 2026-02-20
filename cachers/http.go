@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"strconv"
 
@@ -42,7 +44,22 @@ type HTTPClient struct {
 	// Get returns a cache miss and Put returns the local disk result,
 	// silently ignoring any HTTP failures (connection errors, server errors, etc.).
 	BestEffortHTTP bool
+
+	// ConnCallback, if non-nil, is called after each HTTP request with
+	// the error (nil on success). Used for server health tracking.
+	ConnCallback func(err error)
 }
+
+func isConnError(err error) bool {
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return true
+	}
+	var dnsErr *net.DNSError
+	return errors.As(err, &dnsErr)
+}
+
+func is5xx(code int) bool { return code >= 500 && code < 600 }
 
 func (c *HTTPClient) httpClient() *http.Client {
 	if c.HTTPClient != nil {
@@ -108,10 +125,16 @@ func (c *HTTPClient) Get(ctx context.Context, actionID string) (outputID, diskPa
 
 	res, err := c.httpClient().Do(req)
 	if err != nil {
+		if c.ConnCallback != nil && isConnError(err) {
+			c.ConnCallback(err)
+		}
 		if c.BestEffortHTTP {
 			return "", "", nil
 		}
 		return "", "", err
+	}
+	if c.ConnCallback != nil && !is5xx(res.StatusCode) {
+		c.ConnCallback(nil)
 	}
 	defer res.Body.Close()
 	defer tryDrainResponse(res)
@@ -127,6 +150,10 @@ func (c *HTTPClient) Get(ctx context.Context, actionID string) (outputID, diskPa
 			// 401: can happen when gocached restarts during a session, as it
 			// doesn't persist access tokens.
 			// TODO(tomhjp): make the client retry auth in the background.
+		} else if c.BestEffortHTTP && is5xx(res.StatusCode) {
+			if c.ConnCallback != nil {
+				c.ConnCallback(fmt.Errorf("GET /action/%s: %s", actionID, res.Status))
+			}
 		} else {
 			log.Printf("error GET /action/%s: %v, %s", actionID, res.Status, msg)
 		}
@@ -169,10 +196,16 @@ func (c *HTTPClient) Get(ctx context.Context, actionID string) (outputID, diskPa
 			req.Header.Set("Accept-Encoding", "lz4")
 			res, err = c.httpClient().Do(req)
 			if err != nil {
+				if c.ConnCallback != nil && isConnError(err) {
+					c.ConnCallback(err)
+				}
 				if c.BestEffortHTTP {
 					return "", "", nil
 				}
 				return "", "", err
+			}
+			if c.ConnCallback != nil && !is5xx(res.StatusCode) {
+				c.ConnCallback(nil)
 			}
 			defer res.Body.Close()
 			defer tryDrainResponse(res)
@@ -181,7 +214,13 @@ func (c *HTTPClient) Get(ctx context.Context, actionID string) (outputID, diskPa
 			}
 			if res.StatusCode != http.StatusOK {
 				msg := tryReadErrorMessage(res)
-				log.Printf("error GET /output/%s: %v, %s", outputID, res.Status, msg)
+				if c.BestEffortHTTP && is5xx(res.StatusCode) {
+					if c.ConnCallback != nil {
+						c.ConnCallback(fmt.Errorf("GET /output/%s: %s", outputID, res.Status))
+					}
+				} else {
+					log.Printf("error GET /output/%s: %v, %s", outputID, res.Status, msg)
+				}
 				if c.BestEffortHTTP {
 					return "", "", nil
 				}
@@ -231,9 +270,17 @@ func (c *HTTPClient) Put(ctx context.Context, actionID, outputID string, size in
 	res, err := c.httpClient().Do(req)
 	var httpErr error
 	if err != nil {
-		log.Printf("error PUT /%s/%s: %v", actionID, outputID, err)
+		if c.ConnCallback != nil && isConnError(err) {
+			c.ConnCallback(err)
+		}
+		if !(c.BestEffortHTTP && isConnError(err)) {
+			log.Printf("error PUT /%s/%s: %v", actionID, outputID, err)
+		}
 		httpErr = err
 	} else {
+		if c.ConnCallback != nil && !is5xx(res.StatusCode) {
+			c.ConnCallback(nil)
+		}
 		defer res.Body.Close()
 		if res.StatusCode != http.StatusNoContent {
 			msg := tryReadErrorMessage(res)
@@ -248,6 +295,10 @@ func (c *HTTPClient) Put(ctx context.Context, actionID, outputID string, size in
 				// 403: can happen when authed with a JWT that didn't grant global
 				// write permissions.
 				// TODO(tomhjp): support namespaces so all sessions can safely write.
+			} else if c.BestEffortHTTP && is5xx(res.StatusCode) {
+				if c.ConnCallback != nil {
+					c.ConnCallback(fmt.Errorf("PUT /%s/%s: %s", actionID, outputID, res.Status))
+				}
 			} else {
 				log.Printf("error PUT /%s/%s: %v, %s", actionID, outputID, res.Status, msg)
 			}

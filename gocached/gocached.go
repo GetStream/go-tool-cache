@@ -67,7 +67,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	dto "github.com/prometheus/client_model/go"
-	_ "modernc.org/sqlite"
+	sqlite "modernc.org/sqlite"
 )
 
 const (
@@ -89,6 +89,15 @@ const (
 	// configurable in future, but for now just needs to be specific to gocached.
 	gocachedAudience = "gocached"
 )
+
+func init() {
+	// Ensure schema exists on every new pool connection, so tables are
+	// recreated if the database file is deleted while running.
+	sqlite.RegisterConnectionHook(func(conn sqlite.ExecQuerierContext, dsn string) error {
+		_, err := conn.ExecContext(context.Background(), schema, nil)
+		return err
+	})
+}
 
 const schemaVersion = 4
 
@@ -154,7 +163,7 @@ func openDB(dbDir string) (*sql.DB, error) {
 	db.SetMaxOpenConns(numConns)
 	db.SetMaxIdleConns(numConns)
 	db.SetConnMaxLifetime(0) // no limit
-	if _, err := db.Exec(schema); err != nil {
+	if err := db.Ping(); err != nil { // triggers connection hook to run schema
 		return nil, err
 	}
 	return db, nil

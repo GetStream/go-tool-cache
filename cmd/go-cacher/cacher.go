@@ -83,6 +83,13 @@ func main() {
 
 	if *serverBase != "" {
 		urls := strings.Split(*serverBase, ",")
+		for i, u := range urls {
+			u = strings.TrimSpace(u)
+			if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
+				u = "http://" + u
+			}
+			urls[i] = u
+		}
 		if len(urls) == 1 {
 			// Single server: use existing HTTPClient directly (no regression)
 			hc := &cachers.HTTPClient{
@@ -98,7 +105,7 @@ func main() {
 			clients := make([]*cachers.HTTPClient, len(urls))
 			for i, u := range urls {
 				clients[i] = &cachers.HTTPClient{
-					BaseURL:        strings.TrimSpace(u),
+					BaseURL:        u,
 					Disk:           dc,
 					Verbose:        *verbose,
 					AccessToken:    *token,

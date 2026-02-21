@@ -141,6 +141,9 @@ CREATE TABLE IF NOT EXISTS Namespaces (
 `
 
 func openDB(dbDir string) (*sql.DB, error) {
+	if err := os.MkdirAll(dbDir, 0o700); err != nil {
+		return nil, err
+	}
 	dbPath := filepath.Join(dbDir, fmt.Sprintf("gocached-v%d.db", schemaVersion))
 
 	// If the v4 DB doesn't exist but v3 does, migrate it.

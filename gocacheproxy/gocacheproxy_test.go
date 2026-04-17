@@ -70,12 +70,12 @@ func TestProxyGetRouting(t *testing.T) {
 	}
 }
 
-func TestProxyGetFallback(t *testing.T) {
-	called := [3]int{}
+func TestProxyGetPrimaryDownReturns404(t *testing.T) {
+	// Cache is best-effort: if the primary backend is unreachable we return
+	// 404 (miss) instead of fanning out to other backends.
 	backends := make([]*httptest.Server, 3)
 	for i := range backends {
 		backends[i] = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			called[i]++
 			w.Header().Set("Content-Type", "application/json")
 			w.Write([]byte(`{"outputID":"cafe0001","size":4}`))
 		}))
@@ -85,7 +85,7 @@ func TestProxyGetFallback(t *testing.T) {
 	actionID := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 	primary := ServerIndex(actionID, 3)
 
-	// Close the primary backend to force fallback.
+	// Close the primary backend; the others remain up.
 	backends[primary].Close()
 
 	p := &Proxy{
@@ -101,8 +101,8 @@ func TestProxyGetFallback(t *testing.T) {
 	rec := httptest.NewRecorder()
 	p.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("GET with fallback status = %d, want 200", rec.Code)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("GET with primary down status = %d, want 404", rec.Code)
 	}
 }
 
@@ -207,7 +207,8 @@ func TestProxyHeaderPassthrough(t *testing.T) {
 	}
 }
 
-func TestAllBackendsFail(t *testing.T) {
+func TestGetBackendUnreachable(t *testing.T) {
+	// Proxy returns 404 (miss) when the primary backend is unreachable.
 	p := &Proxy{
 		Backends: []*Backend{
 			{URL: "http://localhost:1"},
@@ -222,8 +223,8 @@ func TestAllBackendsFail(t *testing.T) {
 	rec := httptest.NewRecorder()
 	p.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502", rec.Code)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
 	}
 }
 
@@ -299,53 +300,123 @@ func TestProxyPutRetryExhausted(t *testing.T) {
 	rec := httptest.NewRecorder()
 	p.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("PUT status after exhausted retries = %d, want 502", rec.Code)
+	// Best-effort cache: PUT never surfaces an error to the runner.
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("PUT status after exhausted retries = %d, want 204", rec.Code)
 	}
 	if got := attempts.Load(); got != 3 {
 		t.Fatalf("attempts = %d, want 3 (1 + 2 retries)", got)
 	}
+	// PutErr counter should be incremented exactly once.
+	if got := p.stats.PutErr.Load(); got != 1 {
+		t.Fatalf("PutErr = %d, want 1", got)
+	}
 }
 
-func TestUnhealthyBackendSkipped(t *testing.T) {
-	var callCount atomic.Int32
+func TestProxyPutDropped(t *testing.T) {
+	// With an absurdly tight inflight budget, any PUT gets dropped.
+	var backendCalls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		callCount.Add(1)
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"outputID":"beef0001","size":4}`))
+		backendCalls.Add(1)
+		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer srv.Close()
 
 	p := &Proxy{
-		Backends: []*Backend{
-			{URL: "http://localhost:1"}, // unhealthy
-			{URL: srv.URL},             // healthy
-		},
-		Client: &http.Client{Timeout: 2 * time.Second},
+		Backends:         []*Backend{{URL: srv.URL}},
+		Client:           &http.Client{Timeout: 2 * time.Second},
+		MaxInflightBytes: 1,
 	}
-	p.Backends[0].healthy.Store(false)
-	p.Backends[1].healthy.Store(true)
+	p.Backends[0].healthy.Store(true)
 
-	var actionID string
-	for i := 0; i < 256; i++ {
-		candidate := strings.Repeat("0", 6) + string([]byte{
-			"0123456789abcdef"[i/16],
-			"0123456789abcdef"[i%16],
-		})
-		if ServerIndex(candidate, 2) == 0 {
-			actionID = candidate
-			break
-		}
-	}
-	if actionID == "" {
-		t.Skip("couldn't find actionID that hashes to backend 0")
-	}
-
-	req := httptest.NewRequest("GET", "/action/"+actionID, nil)
+	req := httptest.NewRequest("PUT", "/abcdef01/beef0001", strings.NewReader("hello"))
+	req.ContentLength = 5
 	rec := httptest.NewRecorder()
 	p.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rec.Code)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("dropped PUT status = %d, want 204", rec.Code)
+	}
+	if got := p.stats.PutDropped.Load(); got != 1 {
+		t.Fatalf("PutDropped = %d, want 1", got)
+	}
+	if got := backendCalls.Load(); got != 0 {
+		t.Fatalf("backend was called %d times on a dropped PUT, want 0", got)
+	}
+	if got := p.inflightBytes.Load(); got != 0 {
+		t.Fatalf("inflightBytes after drop = %d, want 0", got)
+	}
+}
+
+func TestProxyInflightReleasesOnSuccess(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	p := &Proxy{
+		Backends:         []*Backend{{URL: srv.URL}},
+		Client:           &http.Client{Timeout: 2 * time.Second},
+		MaxInflightBytes: 1024,
+	}
+	p.Backends[0].healthy.Store(true)
+
+	for i := 0; i < 10; i++ {
+		req := httptest.NewRequest("PUT", "/abcdef01/beef0001", strings.NewReader("hello"))
+		req.ContentLength = 5
+		rec := httptest.NewRecorder()
+		p.ServeHTTP(rec, req)
+		if got := p.inflightBytes.Load(); got != 0 {
+			t.Fatalf("iter %d: inflightBytes = %d after PUT, want 0", i, got)
+		}
+	}
+	if got := p.stats.PutOK.Load(); got != 10 {
+		t.Fatalf("PutOK = %d, want 10", got)
+	}
+}
+
+func TestProxyStatsCounters(t *testing.T) {
+	var nextStatus atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch nextStatus.Load() {
+		case 200:
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"outputID":"a","size":1}`))
+		case 404:
+			http.NotFound(w, r)
+		default:
+			w.WriteHeader(http.StatusNoContent)
+		}
+	}))
+	defer srv.Close()
+
+	p := &Proxy{
+		Backends: []*Backend{{URL: srv.URL}},
+		Client:   &http.Client{Timeout: 2 * time.Second},
+	}
+	p.Backends[0].healthy.Store(true)
+
+	// One hit, one miss.
+	for _, status := range []int32{200, 404} {
+		nextStatus.Store(status)
+		rec := httptest.NewRecorder()
+		p.ServeHTTP(rec, httptest.NewRequest("GET", "/action/abcdef01", nil))
+	}
+	// One successful PUT.
+	nextStatus.Store(204)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("PUT", "/abcdef01/beef0001", strings.NewReader("x"))
+	req.ContentLength = 1
+	p.ServeHTTP(rec, req)
+
+	if got := p.stats.GetHit.Load(); got != 1 {
+		t.Errorf("GetHit = %d, want 1", got)
+	}
+	if got := p.stats.GetMiss.Load(); got != 1 {
+		t.Errorf("GetMiss = %d, want 1", got)
+	}
+	if got := p.stats.PutOK.Load(); got != 1 {
+		t.Errorf("PutOK = %d, want 1", got)
 	}
 }

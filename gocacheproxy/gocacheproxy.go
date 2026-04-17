@@ -5,10 +5,13 @@ package gocacheproxy
 import (
 	"bytes"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,13 +25,35 @@ type Backend struct {
 }
 
 // Proxy routes cache requests to backends using consistent hashing.
+//
+// The proxy is best-effort: GET returns 200 (hit) or 404 (miss/error);
+// PUT always returns 204 even if the upload ultimately failed, because a
+// cache failure should never break the build — the compiler will just
+// re-cache next time. All errors are logged and counted so we can observe
+// cache health separately from the runner-visible outcome.
 type Proxy struct {
 	Backends []*Backend
 	Client   *http.Client
 	// Retries is the number of retries after the initial attempt on PUT.
 	// Total attempts = 1 + Retries. Set to 0 to disable retries.
 	Retries int
-	Verbose bool
+	// MaxInflightBytes is the soft cap on total buffered PUT body bytes.
+	// A PUT whose Content-Length would push us over is dropped silently
+	// (logged and counted). 0 disables the check.
+	MaxInflightBytes int64
+	Verbose          bool
+
+	stats         stats
+	inflightBytes atomic.Int64
+}
+
+type stats struct {
+	GetHit     atomic.Int64
+	GetMiss    atomic.Int64
+	GetErr     atomic.Int64 // transport error or unexpected status from backend
+	PutOK      atomic.Int64
+	PutErr     atomic.Int64 // retries exhausted
+	PutDropped atomic.Int64 // shed before attempting, due to inflight budget
 }
 
 const healthPath = "/health"
@@ -74,44 +99,64 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// proxyGet forwards a GET /action/<actionID> to the primary backend,
-// falling back to other backends on failure.
+// proxyGet forwards a GET /action/<actionID> to the primary backend only.
+// On transport error or unexpected status, returns 404 (cache miss) so that
+// the runner just rebuilds. Never returns 5xx to the caller.
 func (p *Proxy) proxyGet(w http.ResponseWriter, r *http.Request, actionID string) {
-	n := len(p.Backends)
-	primary := ServerIndex(actionID, n)
+	primary := ServerIndex(actionID, len(p.Backends))
+	b := p.Backends[primary]
 
-	for i := 0; i < n; i++ {
-		idx := (primary + i) % n
-		b := p.Backends[idx]
-		if i > 0 && !b.healthy.Load() {
-			continue
-		}
-
-		resp, err := p.forward(r, b, r.URL.RequestURI(), nil)
-		if err != nil {
-			log.Printf("GET %s backend %d (%s) error: %v", r.URL.Path, idx, b.URL, err)
-			continue
-		}
-
-		copyResponse(w, resp)
-		resp.Body.Close()
+	resp, err := p.forward(r, b, r.URL.RequestURI(), nil)
+	if err != nil {
+		p.stats.GetErr.Add(1)
+		log.Printf("GET %s backend %d (%s) error: %v", r.URL.Path, primary, b.URL, err)
+		http.NotFound(w, r)
 		return
 	}
-
-	http.Error(w, "all backends failed", http.StatusBadGateway)
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK:
+		p.stats.GetHit.Add(1)
+	case http.StatusNotFound:
+		p.stats.GetMiss.Add(1)
+	default:
+		p.stats.GetErr.Add(1)
+		log.Printf("GET %s backend %d (%s) unexpected status %d",
+			r.URL.Path, primary, b.URL, resp.StatusCode)
+	}
+	copyResponse(w, resp)
 }
 
 // proxyPut forwards a PUT to the primary backend with retries. The body is
-// buffered so it can be resent; on persistent failure, returns 502.
+// buffered so it can be resent. Never returns 5xx to the caller: on exhausted
+// retries we log and return 204. A failed PUT just means the next build will
+// re-upload.
 func (p *Proxy) proxyPut(w http.ResponseWriter, r *http.Request, actionID string) {
 	n := len(p.Backends)
 	primary := ServerIndex(actionID, n)
 	b := p.Backends[primary]
 
+	// Shed under memory pressure: reserve inflight budget before reading the
+	// full body into memory.
+	reserve := r.ContentLength
+	if reserve < 0 {
+		reserve = 32 << 20 // unknown size → conservative reservation
+	}
+	if !p.reserveInflight(reserve) {
+		p.stats.PutDropped.Add(1)
+		log.Printf("PUT %s dropped: inflight %d+%d > %d (bytes)",
+			r.URL.Path, p.inflightBytes.Load(), reserve, p.MaxInflightBytes)
+		io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	defer p.releaseInflight(reserve)
+
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		p.stats.PutErr.Add(1)
 		log.Printf("PUT %s read body error: %v", r.URL.Path, err)
-		http.Error(w, "read body", http.StatusBadRequest)
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
@@ -124,6 +169,7 @@ func (p *Proxy) proxyPut(w http.ResponseWriter, r *http.Request, actionID string
 				log.Printf("PUT %s backend %d (%s) ok on attempt %d/%d (%d bytes)",
 					r.URL.Path, primary, b.URL, attempt, attempts, len(body))
 			}
+			p.stats.PutOK.Add(1)
 			copyResponse(w, resp)
 			resp.Body.Close()
 			return
@@ -135,9 +181,83 @@ func (p *Proxy) proxyPut(w http.ResponseWriter, r *http.Request, actionID string
 			time.Sleep(time.Duration(attempt) * 50 * time.Millisecond)
 		}
 	}
+	p.stats.PutErr.Add(1)
 	log.Printf("PUT %s backend %d (%s) failed after %d attempts (%d bytes); last error: %v",
 		r.URL.Path, primary, b.URL, attempts, len(body), lastErr)
-	http.Error(w, "backend error", http.StatusBadGateway)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// LogStats periodically logs aggregate counters. Blocks forever; run in a
+// goroutine.
+func (p *Proxy) LogStats(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for range ticker.C {
+		h := p.stats.GetHit.Load()
+		m := p.stats.GetMiss.Load()
+		e := p.stats.GetErr.Load()
+		po := p.stats.PutOK.Load()
+		pe := p.stats.PutErr.Load()
+		pd := p.stats.PutDropped.Load()
+		var hitRate float64
+		if hm := h + m; hm > 0 {
+			hitRate = float64(h) * 100 / float64(hm)
+		}
+		log.Printf("stats: gets=%d hits=%d misses=%d errors=%d hit_rate=%.1f%% | puts=%d ok=%d errors=%d dropped=%d inflight_bytes=%d",
+			h+m+e, h, m, e, hitRate, po+pe+pd, po, pe, pd, p.inflightBytes.Load())
+	}
+}
+
+// reserveInflight atomically reserves n bytes of inflight PUT budget. Returns
+// false if the reservation would exceed MaxInflightBytes. When
+// MaxInflightBytes is 0, always succeeds.
+func (p *Proxy) reserveInflight(n int64) bool {
+	if p.MaxInflightBytes <= 0 {
+		return true
+	}
+	for {
+		cur := p.inflightBytes.Load()
+		if cur+n > p.MaxInflightBytes {
+			return false
+		}
+		if p.inflightBytes.CompareAndSwap(cur, cur+n) {
+			return true
+		}
+	}
+}
+
+// releaseInflight releases a previously-reserved inflight budget.
+func (p *Proxy) releaseInflight(n int64) {
+	if p.MaxInflightBytes <= 0 {
+		return
+	}
+	p.inflightBytes.Add(-n)
+}
+
+// DetectMemoryLimit reads the current container's memory limit from the
+// cgroup filesystem. Returns the limit in bytes on success, or an error if
+// the container has no limit configured or the cgroup info is unreadable.
+// Reads cgroup v2 first, falls back to cgroup v1.
+func DetectMemoryLimit() (int64, error) {
+	if b, err := os.ReadFile("/sys/fs/cgroup/memory.max"); err == nil {
+		s := strings.TrimSpace(string(b))
+		if s == "max" {
+			return 0, errors.New("cgroup v2: no memory limit set")
+		}
+		return strconv.ParseInt(s, 10, 64)
+	}
+	if b, err := os.ReadFile("/sys/fs/cgroup/memory/memory.limit_in_bytes"); err == nil {
+		v, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+		if err != nil {
+			return 0, err
+		}
+		// cgroup v1 uses a very large sentinel to mean "no limit".
+		if v >= 1<<60 {
+			return 0, errors.New("cgroup v1: no memory limit set")
+		}
+		return v, nil
+	}
+	return 0, errors.New("no cgroup memory info found")
 }
 
 // forward sends a request to a backend. If body is non-nil, it's used as the

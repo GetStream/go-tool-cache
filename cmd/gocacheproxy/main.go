@@ -16,7 +16,8 @@ var (
 	listenAddr   = flag.String("listen", ":31365", "listen address")
 	backendsFlag = flag.String("backends", "", "comma-separated backend addresses (host:port)")
 	verbose      = flag.Bool("verbose", false, "verbose logging")
-	timeout      = flag.Duration("timeout", 10*time.Second, "per-request timeout for proxied PUT/GET to a backend")
+	timeout      = flag.Duration("timeout", 3*time.Second, "per-attempt timeout for proxied PUT/GET to a backend")
+	retries      = flag.Int("retries", 2, "number of PUT retries after the initial attempt (total attempts = 1 + retries)")
 )
 
 // normalizeURL ensures addr has an http:// scheme.
@@ -44,6 +45,7 @@ func main() {
 	p := &gocacheproxy.Proxy{
 		Backends: backends,
 		Client:   &http.Client{Timeout: *timeout},
+		Retries:  *retries,
 		Verbose:  *verbose,
 	}
 

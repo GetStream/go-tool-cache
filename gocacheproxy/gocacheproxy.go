@@ -3,6 +3,7 @@
 package gocacheproxy
 
 import (
+	"bytes"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -24,7 +25,10 @@ type Backend struct {
 type Proxy struct {
 	Backends []*Backend
 	Client   *http.Client
-	Verbose  bool
+	// Retries is the number of retries after the initial attempt on PUT.
+	// Total attempts = 1 + Retries. Set to 0 to disable retries.
+	Retries int
+	Verbose bool
 }
 
 const healthPath = "/health"
@@ -83,11 +87,9 @@ func (p *Proxy) proxyGet(w http.ResponseWriter, r *http.Request, actionID string
 			continue
 		}
 
-		resp, err := p.forward(r, b, r.URL.RequestURI())
+		resp, err := p.forward(r, b, r.URL.RequestURI(), nil)
 		if err != nil {
-			if p.Verbose {
-				log.Printf("GET %s backend %d (%s) error: %v", r.URL.Path, idx, b.URL, err)
-			}
+			log.Printf("GET %s backend %d (%s) error: %v", r.URL.Path, idx, b.URL, err)
 			continue
 		}
 
@@ -99,34 +101,62 @@ func (p *Proxy) proxyGet(w http.ResponseWriter, r *http.Request, actionID string
 	http.Error(w, "all backends failed", http.StatusBadGateway)
 }
 
-// proxyPut forwards a PUT to the primary backend only (no fallback).
+// proxyPut forwards a PUT to the primary backend with retries. The body is
+// buffered so it can be resent; on persistent failure, returns 502.
 func (p *Proxy) proxyPut(w http.ResponseWriter, r *http.Request, actionID string) {
 	n := len(p.Backends)
 	primary := ServerIndex(actionID, n)
 	b := p.Backends[primary]
 
-	resp, err := p.forward(r, b, r.URL.RequestURI())
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		if p.Verbose {
-			log.Printf("PUT %s backend %d (%s) error: %v", r.URL.Path, primary, b.URL, err)
-		}
-		http.Error(w, "backend error", http.StatusBadGateway)
+		log.Printf("PUT %s read body error: %v", r.URL.Path, err)
+		http.Error(w, "read body", http.StatusBadRequest)
 		return
 	}
-	defer resp.Body.Close()
 
-	copyResponse(w, resp)
+	attempts := 1 + p.Retries
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		resp, err := p.forward(r, b, r.URL.RequestURI(), body)
+		if err == nil {
+			if attempt > 1 {
+				log.Printf("PUT %s backend %d (%s) ok on attempt %d/%d (%d bytes)",
+					r.URL.Path, primary, b.URL, attempt, attempts, len(body))
+			}
+			copyResponse(w, resp)
+			resp.Body.Close()
+			return
+		}
+		lastErr = err
+		log.Printf("PUT %s backend %d (%s) attempt %d/%d error (%d bytes): %v",
+			r.URL.Path, primary, b.URL, attempt, attempts, len(body), err)
+		if attempt < attempts {
+			time.Sleep(time.Duration(attempt) * 50 * time.Millisecond)
+		}
+	}
+	log.Printf("PUT %s backend %d (%s) failed after %d attempts (%d bytes); last error: %v",
+		r.URL.Path, primary, b.URL, attempts, len(body), lastErr)
+	http.Error(w, "backend error", http.StatusBadGateway)
 }
 
-func (p *Proxy) forward(orig *http.Request, b *Backend, path string) (*http.Response, error) {
+// forward sends a request to a backend. If body is non-nil, it's used as the
+// request body; otherwise the request is sent with no body (for GET).
+func (p *Proxy) forward(orig *http.Request, b *Backend, path string, body []byte) (*http.Response, error) {
 	url := b.URL + path
-	req, err := http.NewRequestWithContext(orig.Context(), orig.Method, url, orig.Body)
+	var reqBody io.Reader
+	if body != nil {
+		reqBody = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(orig.Context(), orig.Method, url, reqBody)
 	if err != nil {
 		return nil, err
 	}
-	req.ContentLength = orig.ContentLength
+	if body != nil {
+		req.ContentLength = int64(len(body))
+	}
 
-	for _, h := range []string{"Authorization", "Want-Object", "Accept-Encoding", "Content-Type", "Content-Length"} {
+	for _, h := range []string{"Authorization", "Want-Object", "Accept-Encoding", "Content-Type"} {
 		if v := orig.Header.Get(h); v != "" {
 			req.Header.Set(h, v)
 		}

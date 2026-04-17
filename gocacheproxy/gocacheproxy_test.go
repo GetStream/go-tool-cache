@@ -227,6 +227,86 @@ func TestAllBackendsFail(t *testing.T) {
 	}
 }
 
+func TestProxyPutRetrySucceeds(t *testing.T) {
+	var attempts atomic.Int32
+	var gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := attempts.Add(1)
+		if n < 3 {
+			// Simulate backend stall; hijack to drop the connection so the
+			// proxy's http.Client returns an error rather than an HTTP status.
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Errorf("hijacker not supported")
+				return
+			}
+			conn, _, _ := hj.Hijack()
+			conn.Close()
+			return
+		}
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	p := &Proxy{
+		Backends: []*Backend{{URL: srv.URL}},
+		Client:   &http.Client{Timeout: 2 * time.Second},
+		Retries:  2,
+	}
+	p.Backends[0].healthy.Store(true)
+
+	req := httptest.NewRequest("PUT", "/abcdef01/beef0001", strings.NewReader("hello"))
+	req.ContentLength = 5
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("PUT after retry status = %d, want 204", rec.Code)
+	}
+	if got := attempts.Load(); got != 3 {
+		t.Fatalf("attempts = %d, want 3", got)
+	}
+	if gotBody != "hello" {
+		t.Fatalf("body after retry = %q, want hello", gotBody)
+	}
+}
+
+func TestProxyPutRetryExhausted(t *testing.T) {
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Errorf("hijacker not supported")
+			return
+		}
+		conn, _, _ := hj.Hijack()
+		conn.Close()
+	}))
+	defer srv.Close()
+
+	p := &Proxy{
+		Backends: []*Backend{{URL: srv.URL}},
+		Client:   &http.Client{Timeout: 2 * time.Second},
+		Retries:  2,
+	}
+	p.Backends[0].healthy.Store(true)
+
+	req := httptest.NewRequest("PUT", "/abcdef01/beef0001", strings.NewReader("hello"))
+	req.ContentLength = 5
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("PUT status after exhausted retries = %d, want 502", rec.Code)
+	}
+	if got := attempts.Load(); got != 3 {
+		t.Fatalf("attempts = %d, want 3 (1 + 2 retries)", got)
+	}
+}
+
 func TestUnhealthyBackendSkipped(t *testing.T) {
 	var callCount atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

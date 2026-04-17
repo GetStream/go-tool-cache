@@ -16,6 +16,7 @@ var (
 	listenAddr   = flag.String("listen", ":31365", "listen address")
 	backendsFlag = flag.String("backends", "", "comma-separated backend addresses (host:port)")
 	verbose      = flag.Bool("verbose", false, "verbose logging")
+	timeout      = flag.Duration("timeout", 10*time.Second, "per-request timeout for proxied PUT/GET to a backend")
 )
 
 // normalizeURL ensures addr has an http:// scheme.
@@ -42,7 +43,7 @@ func main() {
 
 	p := &gocacheproxy.Proxy{
 		Backends: backends,
-		Client:   &http.Client{Timeout: 60 * time.Second},
+		Client:   &http.Client{Timeout: *timeout},
 		Verbose:  *verbose,
 	}
 

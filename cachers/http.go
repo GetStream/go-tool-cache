@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/GetStream/go-tool-cache/wire"
 	"github.com/pierrec/lz4/v4"
 )
 
@@ -184,6 +185,9 @@ func (c *HTTPClient) Get(ctx context.Context, actionID string) (outputID, diskPa
 	if c.AccessToken != "" {
 		req.Header.Set("Authorization", "Bearer "+c.AccessToken)
 	}
+	if kind := wire.ActionKindFromContext(ctx); kind != "" {
+		req.Header.Set(wire.ActionKindHeader, kind)
+	}
 
 	req.Header.Set("Accept-Encoding", "lz4")
 
@@ -316,10 +320,12 @@ func (c *HTTPClient) Put(ctx context.Context, actionID, outputID string, size in
 		return "", err
 	}
 
+	kind := wire.ActionKindFromContext(ctx)
 	if c.BestEffortHTTP {
 		sem := c.asyncPutSemaphore()
 		// Background PUTs use a client-owned context, not the per-request ctx,
-		// so they survive the RPC returning.
+		// so they survive the RPC returning. ActionKind is copied explicitly
+		// because that context does not inherit the request values.
 		putCtx := c.asyncPutContext()
 		c.inFlightWG.Go(func() {
 			// Acquire a concurrency slot before opening the file, so a queued
@@ -340,7 +346,7 @@ func (c *HTTPClient) Put(ctx context.Context, actionID, outputID string, size in
 				log.Printf("HTTPClient.Put local disk open after write error: %v", err)
 				return
 			}
-			c.putRemote(putCtx, actionID, outputID, size, f)
+			c.putRemote(putCtx, actionID, outputID, size, f, kind)
 		})
 		return diskPath, nil
 	}
@@ -350,14 +356,14 @@ func (c *HTTPClient) Put(ctx context.Context, actionID, outputID string, size in
 		log.Printf("HTTPClient.Put local disk open after write error: %v", err)
 		return "", err
 	}
-	if err := c.putRemote(ctx, actionID, outputID, size, f); err != nil {
+	if err := c.putRemote(ctx, actionID, outputID, size, f, kind); err != nil {
 		return diskPath, err
 	}
 
 	return diskPath, nil
 }
 
-func (c *HTTPClient) putRemote(ctx context.Context, actionID, outputID string, size int64, body io.ReadCloser) error {
+func (c *HTTPClient) putRemote(ctx context.Context, actionID, outputID string, size int64, body io.ReadCloser, kind string) error {
 	defer body.Close()
 	if c.BestEffortHTTP && c.AsyncPutTimeout != nil {
 		if d := c.AsyncPutTimeout(size); d > 0 {
@@ -387,6 +393,9 @@ func (c *HTTPClient) putRemote(ctx context.Context, actionID, outputID string, s
 	req.ContentLength = size
 	if c.AccessToken != "" {
 		req.Header.Set("Authorization", "Bearer "+c.AccessToken)
+	}
+	if kind != "" {
+		req.Header.Set(wire.ActionKindHeader, kind)
 	}
 
 	res, err := c.httpClient().Do(req)

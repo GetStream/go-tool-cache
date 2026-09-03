@@ -7,7 +7,53 @@
 // the cache interface.
 package wire
 
-import "io"
+import (
+	"context"
+	"io"
+)
+
+// ActionKindHeader is the HTTP header go-cacher uses to forward Request.ActionKind
+// to gocached and gocacheproxy. Unpatched cmd/go omits ActionKind, so the header
+// is absent and Prometheus series use action_kind="".
+const ActionKindHeader = "Go-Action-Kind"
+
+type actionKindContextKey struct{}
+
+// ContextWithActionKind returns a child context carrying a sanitized ActionKind.
+// An empty or invalid kind leaves ctx unchanged.
+func ContextWithActionKind(ctx context.Context, kind string) context.Context {
+	kind = SanitizeActionKind(kind)
+	if kind == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, actionKindContextKey{}, kind)
+}
+
+// ActionKindFromContext returns the ActionKind stored by ContextWithActionKind,
+// or "" if none.
+func ActionKindFromContext(ctx context.Context) string {
+	kind, _ := ctx.Value(actionKindContextKey{}).(string)
+	return kind
+}
+
+// SanitizeActionKind returns kind if it is a coarse cache-action token safe
+// for Prometheus labels (compile, link, test, vet, …). Anything else, including
+// NewHash names that embed import paths, is treated as unset so cardinality
+// cannot explode.
+func SanitizeActionKind(kind string) string {
+	if kind == "" || len(kind) > 64 {
+		return ""
+	}
+	for i := 0; i < len(kind); i++ {
+		c := kind[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '-', c == '_':
+		default:
+			return ""
+		}
+	}
+	return kind
+}
 
 // Cmd is a command that can be issued to a child process.
 //
@@ -37,6 +83,11 @@ type Request struct {
 
 	// ActionID is non-nil for get and puts.
 	ActionID []byte `json:",omitempty"` // or nil if not used
+
+	// ActionKind is an optional coarse kind for the cache action (compile,
+	// link, test, vet, …). Stock cmd/go does not send it; a patched toolchain
+	// may. Empty means unknown.
+	ActionKind string `json:",omitempty"`
 
 	// OutputID is set for Type "put" and "output-file".
 	OutputID []byte `json:",omitempty"` // or nil if not used

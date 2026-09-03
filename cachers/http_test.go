@@ -16,6 +16,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/GetStream/go-tool-cache/wire"
 	"github.com/pierrec/lz4/v4"
 )
 
@@ -509,5 +510,44 @@ func TestHTTPClientBestEffort(t *testing.T) {
 				}
 			})
 		})
+	}
+}
+
+func TestHTTPClientActionKindHeader(t *testing.T) {
+	const (
+		testActionID = "aabbccdd"
+		testOutputID = "eeff0011"
+	)
+	var gotGet, gotPut string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case "GET":
+			gotGet = r.Header.Get(wire.ActionKindHeader)
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set("Go-Output-Id", testOutputID)
+			w.Write([]byte("blob"))
+		case "PUT":
+			gotPut = r.Header.Get(wire.ActionKindHeader)
+			io.Copy(io.Discard, r.Body)
+			w.WriteHeader(http.StatusNoContent)
+		}
+	}))
+	defer ts.Close()
+	hc := &HTTPClient{
+		BaseURL: ts.URL,
+		Disk:    &DiskCache{Dir: t.TempDir()},
+	}
+	ctx := wire.ContextWithActionKind(context.Background(), "compile")
+	if _, _, err := hc.Get(ctx, testActionID); err != nil {
+		t.Fatal(err)
+	}
+	if gotGet != "compile" {
+		t.Errorf("GET Go-Action-Kind = %q, want compile", gotGet)
+	}
+	if _, err := hc.Put(ctx, testActionID, testOutputID, 4, bytes.NewReader([]byte("blob"))); err != nil {
+		t.Fatal(err)
+	}
+	if gotPut != "compile" {
+		t.Errorf("PUT Go-Action-Kind = %q, want compile", gotPut)
 	}
 }

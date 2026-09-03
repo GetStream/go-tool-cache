@@ -15,6 +15,7 @@ the "Want-Object: 1" header variant on the GET request.
 
 	GET /action/<actionID-hex>
 	Want-Object: 1
+	Go-Action-Kind: compile   (optional; from patched cmd/go)
 
 	200 OK
 	Content-Type: application/octet-stream
@@ -27,6 +28,7 @@ And to insert an object:
 
 	PUT /<actionID>/<outputID>
 	Content-Length: 1234
+	Go-Action-Kind: compile   (optional)
 
 	<bytes>
 
@@ -63,6 +65,7 @@ import (
 
 	ijwt "github.com/GetStream/go-tool-cache/gocached/internal/jwt"
 	"github.com/GetStream/go-tool-cache/gocached/logger"
+	"github.com/GetStream/go-tool-cache/wire"
 	"github.com/pierrec/lz4/v4"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
@@ -446,14 +449,14 @@ func (srv *Server) start() error {
 	reqLatencyBuckets := []float64{0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2}
 	srv.getDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "gocached_get_duration_seconds",
-		Help:    "wall time of each cache get request, labeled by storage path: hot (hot tier disk), disk, inline, pending (put-queue), none (HEAD request), or error; and type: get (hit), miss (404), or error",
+		Help:    "wall time of each cache get request, labeled by storage path: hot (hot tier disk), disk, inline, pending (put-queue), none (HEAD request), or error; type: get (hit), miss (404), or error; and action_kind when the client sent Go-Action-Kind",
 		Buckets: reqLatencyBuckets,
-	}, []string{"storage", "type"})
+	}, []string{"storage", "type", "action_kind"})
 	srv.putDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "gocached_put_duration_seconds",
-		Help:    "wall time of each cache put request, labeled by storage path: disk, inline, or error; and type: put (success), dup, or error",
+		Help:    "wall time of each cache put request, labeled by storage path: disk, inline, or error; type: put (success), dup, or error; and action_kind when the client sent Go-Action-Kind",
 		Buckets: reqLatencyBuckets,
-	}, []string{"storage", "type"})
+	}, []string{"storage", "type", "action_kind"})
 	blobSizeBuckets := []float64{1}
 	for i := 6; i <= 30; i += 2 {
 		bucket := 1 << i
@@ -461,9 +464,9 @@ func (srv *Server) start() error {
 	}
 	srv.blobSize = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "gocached_blob_size_bytes",
-		Help:    "object size in bytes transmitted on the wire (whether compressed or uncompressed) for successful GETs and PUTs, labeled by storage: hot, disk, inline, or error; and type: get, put, or dup",
+		Help:    "object size in bytes transmitted on the wire (whether compressed or uncompressed) for successful GETs and PUTs, labeled by storage: hot, disk, inline, or error; type: get, put, or dup; and action_kind when the client sent Go-Action-Kind",
 		Buckets: blobSizeBuckets,
-	}, []string{"storage", "type"})
+	}, []string{"storage", "type", "action_kind"})
 	srv.evictionsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "gocached_evictions_total",
 		Help: "blobs evicted by the cleanup loop, labeled by the pressure that triggered the tick (age vs size)",
@@ -1333,6 +1336,10 @@ type actionKey struct {
 	ActionID    string
 }
 
+func requestActionKind(r *http.Request) string {
+	return wire.SanitizeActionKind(r.Header.Get(wire.ActionKindHeader))
+}
+
 func validHex(x string) bool {
 	if len(x) < 4 || len(x) > 1000 || len(x)%2 == 1 {
 		return false
@@ -1372,11 +1379,12 @@ func (srv *Server) handleGetAction(w http.ResponseWriter, r *http.Request, stats
 	defer srv.m.ActiveGets.Add(-1)
 
 	start := srv.now()
+	kind := requestActionKind(r)
 	labels := writeObjectResponseLabels{storage: "error", result: "error"}
 	defer func() {
 		d := srv.now().Sub(start)
 		stats.GetNanos += d.Nanoseconds()
-		srv.getDuration.WithLabelValues(labels.storage, labels.result).Observe(d.Seconds())
+		srv.getDuration.WithLabelValues(labels.storage, labels.result, kind).Observe(d.Seconds())
 	}()
 	stats.Gets++
 	ctx := r.Context()
@@ -1544,6 +1552,7 @@ func (l *writeObjectResponseLabels) markPending() {
 // metric.
 func (srv *Server) writeObjectResponse(w http.ResponseWriter, r *http.Request, stats *stats, src objectSource) (labels writeObjectResponseLabels) {
 	labels = writeObjectResponseLabels{storage: "error", result: "get"}
+	kind := requestActionKind(r)
 
 	outputID := cmp.Or(src.altOutputID, src.sha256hex)
 	isLZ4 := src.storedSize != src.uncompressedSize
@@ -1575,7 +1584,7 @@ func (srv *Server) writeObjectResponse(w http.ResponseWriter, r *http.Request, s
 		stats.GetHitsInline++
 		stats.GetBytes += src.storedSize
 		labels.storage = "inline"
-		srv.blobSize.WithLabelValues(labels.storage, labels.result).Observe(float64(src.storedSize))
+		srv.blobSize.WithLabelValues(labels.storage, labels.result, kind).Observe(float64(src.storedSize))
 		w.Write(src.smallData)
 		return
 	}
@@ -1610,11 +1619,11 @@ func (srv *Server) writeObjectResponse(w http.ResponseWriter, r *http.Request, s
 	if isLZ4 && !clientAcceptsLZ4 {
 		// Client doesn't accept lz4; decompress on the fly.
 		stats.GetBytes += src.uncompressedSize
-		srv.blobSize.WithLabelValues(labels.storage, labels.result).Observe(float64(src.uncompressedSize))
+		srv.blobSize.WithLabelValues(labels.storage, labels.result, kind).Observe(float64(src.uncompressedSize))
 		io.Copy(w, lz4.NewReader(rc))
 	} else {
 		stats.GetBytes += src.storedSize
-		srv.blobSize.WithLabelValues(labels.storage, labels.result).Observe(float64(src.storedSize))
+		srv.blobSize.WithLabelValues(labels.storage, labels.result, kind).Observe(float64(src.storedSize))
 		io.Copy(w, rc)
 	}
 	return
@@ -1922,12 +1931,13 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, stats *stats,
 	defer s.m.ActivePuts.Add(-1)
 
 	start := s.now()
+	kind := requestActionKind(r)
 	storage := "error"
 	result := "error"
 	defer func() {
 		d := s.now().Sub(start)
 		stats.PutsNanos += d.Nanoseconds()
-		s.putDuration.WithLabelValues(storage, result).Observe(d.Seconds())
+		s.putDuration.WithLabelValues(storage, result, kind).Observe(d.Seconds())
 	}()
 
 	if r.Method != "PUT" {
@@ -2051,7 +2061,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, stats *stats,
 	} else {
 		storage = "disk"
 	}
-	s.blobSize.WithLabelValues(storage, result).Observe(float64(r.ContentLength))
+	s.blobSize.WithLabelValues(storage, result, kind).Observe(float64(r.ContentLength))
 
 	w.WriteHeader(http.StatusNoContent)
 }

@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/GetStream/go-tool-cache/cachers"
+	"github.com/GetStream/go-tool-cache/wire"
 	"github.com/go-jose/go-jose/v4"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/go-cmp/cmp"
@@ -2130,5 +2131,74 @@ func baseClaims(iss, sub string) jwt.MapClaims {
 		"aud": gocachedAudience,
 		"nbf": jwt.NewNumericDate(time.Now().Add(-time.Minute)),
 		"exp": jwt.NewNumericDate(time.Now().Add(time.Hour)),
+	}
+}
+
+func TestActionKindPrometheus(t *testing.T) {
+	st := newServerTester(t)
+	const (
+		actionID = "aa01aa01"
+		outputID = "bb02bb02"
+	)
+	val := "hello"
+
+	put, err := http.NewRequest("PUT", st.hs.URL+"/"+actionID+"/"+outputID, strings.NewReader(val))
+	if err != nil {
+		t.Fatal(err)
+	}
+	put.ContentLength = int64(len(val))
+	put.Header.Set(wire.ActionKindHeader, "compile")
+	res, err := http.DefaultClient.Do(put)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusNoContent {
+		t.Fatalf("PUT status = %d", res.StatusCode)
+	}
+	st.drain()
+
+	get, err := http.NewRequest("GET", st.hs.URL+"/action/"+actionID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	get.Header.Set("Want-Object", "1")
+	get.Header.Set(wire.ActionKindHeader, "compile")
+	gres, err := http.DefaultClient.Do(get)
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, gres.Body)
+	gres.Body.Close()
+	if gres.StatusCode != http.StatusOK {
+		t.Fatalf("GET status = %d", gres.StatusCode)
+	}
+
+	body := scrapeMetrics(t, st)
+	for _, want := range []string{
+		`action_kind="compile"`,
+		`gocached_put_duration_seconds_count{`,
+		`gocached_get_duration_seconds_count{`,
+		`gocached_blob_size_bytes_count{`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics missing %q\n%s", want, body)
+		}
+	}
+
+	miss, err := http.NewRequest("GET", st.hs.URL+"/action/cc03cc03", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	miss.Header.Set("Want-Object", "1")
+	mres, err := http.DefaultClient.Do(miss)
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, mres.Body)
+	mres.Body.Close()
+	body = scrapeMetrics(t, st)
+	if !strings.Contains(body, `action_kind=""`) {
+		t.Errorf("unset ActionKind should appear as empty label\n%s", body)
 	}
 }

@@ -12,6 +12,8 @@ import (
 	"time"
 
 	dto "github.com/prometheus/client_model/go"
+
+	"github.com/GetStream/go-tool-cache/wire"
 )
 
 func testActionID() string {
@@ -132,7 +134,7 @@ func TestMalformedActionIDGet(t *testing.T) {
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", rec.Code)
 	}
-	if got := counterVal(t, p.getTotal.WithLabelValues("error")); got != 1 {
+	if got := counterVal(t, p.getTotal.WithLabelValues("error", "")); got != 1 {
 		t.Fatalf("get_total error = %v, want 1", got)
 	}
 }
@@ -251,7 +253,7 @@ func TestProxyGetNoHealthy(t *testing.T) {
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", rec.Code)
 	}
-	if got := counterVal(t, p.getTotal.WithLabelValues("no_healthy_backend")); got != 1 {
+	if got := counterVal(t, p.getTotal.WithLabelValues("no_healthy_backend", "")); got != 1 {
 		t.Fatalf("no_healthy_backend = %v, want 1", got)
 	}
 }
@@ -420,6 +422,7 @@ func TestProxyHeaderPassthrough(t *testing.T) {
 	req.Header.Set("Want-Object", "1")
 	req.Header.Set("Accept-Encoding", "lz4")
 	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set(wire.ActionKindHeader, "compile")
 	rec := httptest.NewRecorder()
 	p.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -433,6 +436,9 @@ func TestProxyHeaderPassthrough(t *testing.T) {
 	}
 	if gotHeaders.Get("Authorization") != "Bearer test-token" {
 		t.Error("Authorization header not forwarded")
+	}
+	if gotHeaders.Get(wire.ActionKindHeader) != "compile" {
+		t.Error("Go-Action-Kind header not forwarded")
 	}
 	if rec.Header().Get("Go-Output-Id") != "cafe0001" {
 		t.Error("Go-Output-Id response header not passed through")
@@ -523,7 +529,7 @@ func TestProxyPutRetryExhausted(t *testing.T) {
 	if got := attempts.Load(); got != 3 {
 		t.Fatalf("attempts = %d, want 3", got)
 	}
-	if got := counterVal(t, p.putErr); got != 1 {
+	if got := counterVal(t, p.putErr.WithLabelValues("")); got != 1 {
 		t.Fatalf("putErr = %v, want 1", got)
 	}
 }
@@ -544,7 +550,7 @@ func TestProxyPutDropped(t *testing.T) {
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("dropped PUT status = %d, want 204", rec.Code)
 	}
-	if got := counterVal(t, p.putDropped); got != 1 {
+	if got := counterVal(t, p.putDropped.WithLabelValues("")); got != 1 {
 		t.Fatalf("putDropped = %v, want 1", got)
 	}
 	if got := backendCalls.Load(); got != 0 {
@@ -569,7 +575,7 @@ func TestProxyInflightReleasesOnSuccess(t *testing.T) {
 			t.Fatalf("iter %d: inflightBytes = %d after PUT, want 0", i, got)
 		}
 	}
-	if got := counterVal(t, p.putOK); got != 10 {
+	if got := counterVal(t, p.putOK.WithLabelValues("")); got != 10 {
 		t.Fatalf("putOK = %v, want 10", got)
 	}
 }
@@ -598,13 +604,13 @@ func TestProxyStatsAndMetricsEndpoint(t *testing.T) {
 	req.ContentLength = 1
 	p.ServeHTTP(httptest.NewRecorder(), req)
 
-	if got := counterVal(t, p.getTotal.WithLabelValues("hit")); got != 1 {
+	if got := counterVal(t, p.getTotal.WithLabelValues("hit", "")); got != 1 {
 		t.Errorf("hit = %v, want 1", got)
 	}
-	if got := counterVal(t, p.getTotal.WithLabelValues("miss")); got != 1 {
+	if got := counterVal(t, p.getTotal.WithLabelValues("miss", "")); got != 1 {
 		t.Errorf("miss = %v, want 1", got)
 	}
-	if got := counterVal(t, p.putOK); got != 1 {
+	if got := counterVal(t, p.putOK.WithLabelValues("")); got != 1 {
 		t.Errorf("putOK = %v, want 1", got)
 	}
 
@@ -615,13 +621,51 @@ func TestProxyStatsAndMetricsEndpoint(t *testing.T) {
 	}
 	body := rec.Body.String()
 	for _, want := range []string{
-		`gocacheproxy_get_total{result="hit"}`,
-		`gocacheproxy_get_total{result="miss"}`,
+		`gocacheproxy_get_total{action_kind="",result="hit"}`,
+		`gocacheproxy_get_total{action_kind="",result="miss"}`,
 		"gocacheproxy_request_duration_seconds",
 		"gocacheproxy_backend_up",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("metrics missing %q", want)
 		}
+	}
+}
+
+func TestProxyActionKindMetrics(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "PUT" {
+			io.Copy(io.Discard, r.Body)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Go-Output-Id", "cafe0001")
+		w.Write([]byte("data"))
+	}))
+	defer srv.Close()
+	p := newTestProxy(t, []*Backend{{URL: srv.URL}})
+
+	get := httptest.NewRequest("GET", "/action/abcdef01", nil)
+	get.Header.Set(wire.ActionKindHeader, "compile")
+	p.ServeHTTP(httptest.NewRecorder(), get)
+
+	put := httptest.NewRequest("PUT", "/abcdef01/beef0001", strings.NewReader("x"))
+	put.ContentLength = 1
+	put.Header.Set(wire.ActionKindHeader, "test")
+	p.ServeHTTP(httptest.NewRecorder(), put)
+
+	if got := counterVal(t, p.getTotal.WithLabelValues("hit", "compile")); got != 1 {
+		t.Errorf("hit compile = %v, want 1", got)
+	}
+	if got := counterVal(t, p.putOK.WithLabelValues("test")); got != 1 {
+		t.Errorf("putOK test = %v, want 1", got)
+	}
+
+	bad := httptest.NewRequest("GET", "/action/abcdef01", nil)
+	bad.Header.Set(wire.ActionKindHeader, "build fmt")
+	p.ServeHTTP(httptest.NewRecorder(), bad)
+	if got := counterVal(t, p.getTotal.WithLabelValues("hit", "")); got != 1 {
+		t.Errorf("invalid ActionKind should count as empty, got %v", got)
 	}
 }

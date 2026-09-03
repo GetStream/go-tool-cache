@@ -2202,3 +2202,80 @@ func TestActionKindPrometheus(t *testing.T) {
 		t.Errorf("unset ActionKind should appear as empty label\n%s", body)
 	}
 }
+
+func TestHealthEndpoint(t *testing.T) {
+	st := newServerTester(t)
+
+	res, err := http.Get(st.hs.URL + "/health")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(res.Body)
+	res.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("GET /health status = %d, want 200", res.StatusCode)
+	}
+	if string(body) != "ok\n" {
+		t.Fatalf("GET /health body = %q, want ok\\n", body)
+	}
+
+	head, err := http.Head(st.hs.URL + "/health")
+	if err != nil {
+		t.Fatal(err)
+	}
+	head.Body.Close()
+	if head.StatusCode != http.StatusOK {
+		t.Fatalf("HEAD /health status = %d, want 200", head.StatusCode)
+	}
+
+	put, err := http.NewRequest("PUT", st.hs.URL+"/health", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pres, err := http.DefaultClient.Do(put)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pres.Body.Close()
+	if pres.StatusCode != http.StatusBadRequest {
+		t.Fatalf("PUT /health status = %d, want 400", pres.StatusCode)
+	}
+}
+
+func TestHealthEndpointUnauthenticatedWithJWT(t *testing.T) {
+	issuer, _ := startOIDCServer(t, testKey1.Public())
+	st := newServerTester(t, WithJWTAuth(issuer))
+
+	action, err := http.NewRequest("GET", st.hs.URL+"/action/aa01aa01", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	action.Header.Set("Want-Object", "1")
+	ares, err := http.DefaultClient.Do(action)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ares.Body.Close()
+	if ares.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("GET /action without token status = %d, want 401", ares.StatusCode)
+	}
+
+	res, err := http.Get(st.hs.URL + "/health")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(res.Body)
+	res.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("GET /health with JWT enabled status = %d, want 200", res.StatusCode)
+	}
+	if string(body) != "ok\n" {
+		t.Fatalf("GET /health body = %q, want ok\\n", body)
+	}
+}

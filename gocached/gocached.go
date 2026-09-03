@@ -92,6 +92,11 @@ const (
 	// gocachedAudience is the audience we require JWTs to have. Could be
 	// configurable in future, but for now just needs to be specific to gocached.
 	gocachedAudience = "gocached"
+
+	// healthPath is a liveness endpoint on the main listener. gocacheproxy
+	// polls it to decide whether a backend may take traffic, so it must stay
+	// unauthenticated and must not require the debug listener to be enabled.
+	healthPath = "/health"
 )
 
 func init() {
@@ -1209,6 +1214,13 @@ func (srv *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		srv.logf("ServeHTTP: %s %s", r.Method, r.RequestURI)
 	}
 
+	// Answered before auth and before request stats: a health probe is not
+	// cache traffic and its caller holds no session.
+	if r.URL.Path == healthPath {
+		srv.serveHealth(w, r)
+		return
+	}
+
 	var sessionData *sessionData // remains nil for unauthenticated requests.
 	reqStats := &stats{}
 	defer func() {
@@ -1218,7 +1230,8 @@ func (srv *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Handle session auth first if enabled.
 	if srv.jwtValidator != nil {
-		// If JWT auth enabled, this is the only unauthenticated (non-debug) endpoint.
+		// If JWT auth enabled, this is the only unauthenticated cache endpoint
+		// besides GET/HEAD /health (answered above).
 		if r.Method == "POST" && r.URL.Path == "/auth/exchange-token" {
 			srv.handleTokenExchange(w, r)
 			return
@@ -1271,6 +1284,23 @@ func (srv *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Error(w, "not found", http.StatusNotFound)
+}
+
+// serveHealth reports that this server is up and serving. It deliberately
+// checks nothing else: a shard whose disk or SQLite is degraded still serves
+// reads better than no shard at all, and taking it out of the ring would
+// reshuffle keys across the whole cluster.
+func (srv *Server) serveHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" && r.Method != "HEAD" {
+		http.Error(w, "bad method", http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	if r.Method == "HEAD" {
+		return
+	}
+	io.WriteString(w, "ok\n")
 }
 
 func (srv *Server) getSessionData(token string) (*sessionData, bool) {

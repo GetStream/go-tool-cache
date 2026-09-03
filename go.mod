@@ -4,6 +4,7 @@ go 1.27.0
 
 require (
 	github.com/bradfitz/parentdeath v0.0.0-20260315043412-764506aeb900
+	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/go-jose/go-jose/v4 v4.1.3
 	github.com/golang-jwt/jwt/v5 v5.3.0
 	github.com/google/go-cmp v0.7.0
@@ -16,7 +17,6 @@ require (
 
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
-	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect

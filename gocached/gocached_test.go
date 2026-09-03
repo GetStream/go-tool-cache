@@ -33,6 +33,8 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/go-cmp/cmp"
 	"github.com/pierrec/lz4/v4"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 )
 
 // sha256OfEmpty is the SHA-256 hash of an empty string, used as a well-known
@@ -54,6 +56,15 @@ func mustGenerateTestKey() *ecdsa.PrivateKey {
 		panic(fmt.Sprintf("generating test ECDSA key: %v", err))
 	}
 	return k
+}
+
+func counterVecValue(t *testing.T, c *prometheus.CounterVec, labels ...string) float64 {
+	t.Helper()
+	var m dto.Metric
+	if err := c.WithLabelValues(labels...).Write(&m); err != nil {
+		t.Fatal(err)
+	}
+	return m.GetCounter().GetValue()
 }
 
 type tester struct {
@@ -757,6 +768,9 @@ func TestCleanOldObjectsByAge(t *testing.T) {
 	if clean1.Count != 1 || clean1.Size != stored1 {
 		t.Errorf("cleanOldObjects got %v, want {Count: 1, Size: %d}", clean1, stored1)
 	}
+	if got := counterVecValue(t, st.srv.evictionsTotal, "age"); got != 1 {
+		t.Errorf("gocached_evictions_total{reason=age} = %v, want 1", got)
+	}
 	clean2 := st.cleanOldObjects()
 	if clean2.Count != 0 || clean2.Size != 0 {
 		t.Errorf("cleanOldObjects got %v, want {Count: 0, Size: 0}", clean2)
@@ -799,6 +813,9 @@ func TestCleanOldObjectsBySize(t *testing.T) {
 
 	if got, want := st.cleanOldObjects(), (countAndSize{Count: 2, Size: 3}); got != want {
 		t.Errorf("cleanOldObjects got %v, want %v", got, want)
+	}
+	if got := counterVecValue(t, st.srv.evictionsTotal, "size"); got != 2 {
+		t.Errorf("gocached_evictions_total{reason=size} = %v, want 2", got)
 	}
 	if got, want := st.usageStats().All(), (countAndSize{Count: 2, Size: 7}); got != want {
 		t.Errorf("usageStats: %v; want %v", got, want)

@@ -241,7 +241,7 @@ func openDB(dbDir string) (*sql.DB, error) {
 	numConns := min(runtime.NumCPU(), 4)
 	db.SetMaxOpenConns(numConns)
 	db.SetMaxIdleConns(numConns)
-	db.SetConnMaxLifetime(0) // no limit
+	db.SetConnMaxLifetime(0)          // no limit
 	if err := db.Ping(); err != nil { // triggers connection hook to run schema
 		return nil, err
 	}
@@ -464,6 +464,10 @@ func (srv *Server) start() error {
 		Help:    "object size in bytes transmitted on the wire (whether compressed or uncompressed) for successful GETs and PUTs, labeled by storage: hot, disk, inline, or error; and type: get, put, or dup",
 		Buckets: blobSizeBuckets,
 	}, []string{"storage", "type"})
+	srv.evictionsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "gocached_evictions_total",
+		Help: "blobs evicted by the cleanup loop, labeled by the pressure that triggered the tick (age vs size)",
+	}, []string{"reason"})
 
 	// Fill the namespace ID cache.
 	rows, err := srv.db.Query("SELECT NamespaceID, Namespace FROM Namespaces")
@@ -505,7 +509,7 @@ func (srv *Server) start() error {
 		collectors.NewBuildInfoCollector(),
 	)
 	srv.registerMetrics(reg)
-	reg.MustRegister(srv.shardScanDuration, srv.getDuration, srv.putDuration, srv.blobSize)
+	reg.MustRegister(srv.shardScanDuration, srv.getDuration, srv.putDuration, srv.blobSize, srv.evictionsTotal)
 
 	// Per-scrape gauges for shard stats loop health. GaugeFunc recomputes on
 	// every Prometheus scrape, so the values stay fresh between scans
@@ -1049,6 +1053,10 @@ type Server struct {
 	getDuration *prometheus.HistogramVec
 	putDuration *prometheus.HistogramVec
 	blobSize    *prometheus.HistogramVec
+
+	// evictionsTotal counts blobs removed by the cleanup loop, labeled by
+	// whether the tick ran because of maxAge or maxSize pressure.
+	evictionsTotal *prometheus.CounterVec
 
 	// Metrics. Exported fields for reflection, but within a private struct
 	// field to control the gocached Server API surface.
@@ -2949,7 +2957,15 @@ func (srv *Server) cleanupTick(ctx context.Context) (countAndSize, error) {
 	if !overAge && overSize {
 		maxBytes = all.Size - srv.maxSize
 	}
-	return srv.evictOldestActions(ctx, cutoff, cleanupBatchSize, maxBytes)
+	ret, err := srv.evictOldestActions(ctx, cutoff, cleanupBatchSize, maxBytes)
+	if err == nil && ret.Count > 0 && srv.evictionsTotal != nil {
+		reason := "size"
+		if overAge {
+			reason = "age"
+		}
+		srv.evictionsTotal.WithLabelValues(reason).Add(float64(ret.Count))
+	}
+	return ret, err
 }
 
 // checkpointTruncate runs PRAGMA wal_checkpoint(TRUNCATE) and returns SQLite's

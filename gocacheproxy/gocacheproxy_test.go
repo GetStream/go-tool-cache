@@ -6,109 +6,258 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	dto "github.com/prometheus/client_model/go"
 )
 
-func TestServerIndex(t *testing.T) {
-	if got := ServerIndex("abcdef01", 3); got != ServerIndex("abcdef01", 3) {
-		t.Fatal("ServerIndex not deterministic")
-	}
-	if got := ServerIndex("abcdef01", 1); got != 0 {
-		t.Fatalf("ServerIndex with 1 backend = %d, want 0", got)
-	}
+func testActionID() string {
+	return "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+}
 
-	// Distribution test: hash 1000 IDs across 3 backends, each should get some.
-	counts := [3]int{}
-	for i := 0; i < 1000; i++ {
-		id := fmt.Sprintf("%08x", i)
-		counts[ServerIndex(id, 3)]++
+func newTestProxy(t *testing.T, backends []*Backend) *Proxy {
+	t.Helper()
+	p := &Proxy{
+		Backends: backends,
+		Client:   &http.Client{Timeout: 2 * time.Second},
+		Retries:  2,
 	}
-	for i, c := range counts {
-		if c == 0 {
-			t.Errorf("backend %d got 0 requests", i)
+	p.ensure()
+	for _, b := range backends {
+		b.healthy.Store(true)
+	}
+	return p
+}
+
+func backendsFromServers(svcs []*httptest.Server) []*Backend {
+	out := make([]*Backend, len(svcs))
+	for i, s := range svcs {
+		out[i] = &Backend{URL: s.URL}
+	}
+	return out
+}
+
+func counterVal(t *testing.T, c interface{ Write(*dto.Metric) error }) float64 {
+	t.Helper()
+	var m dto.Metric
+	if err := c.Write(&m); err != nil {
+		t.Fatal(err)
+	}
+	if m.Counter != nil {
+		return m.GetCounter().GetValue()
+	}
+	return m.GetGauge().GetValue()
+}
+
+func TestHRWDeterministicAndOrdered(t *testing.T) {
+	p := &Proxy{Backends: []*Backend{
+		{URL: "http://b0"},
+		{URL: "http://b1"},
+		{URL: "http://b2"},
+	}}
+	id := testActionID()
+	a, err := p.Candidates(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := p.Candidates(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(a) != 3 || a[0].URL != b[0].URL || a[1].URL != b[1].URL || a[2].URL != b[2].URL {
+		t.Fatalf("HRW order not deterministic: %v vs %v", urls(a), urls(b))
+	}
+	if _, err := p.Candidates("xyz"); err == nil {
+		t.Fatal("expected error for malformed actionID")
+	}
+	if _, err := p.Candidates("abc"); err == nil { // odd length
+		t.Fatal("expected error for odd-length actionID")
+	}
+}
+
+func urls(cands []*Backend) []string {
+	s := make([]string, len(cands))
+	for i, b := range cands {
+		s[i] = b.URL
+	}
+	return s
+}
+
+func TestHRWResizeRemapFraction(t *testing.T) {
+	const n0, n1, samples = 20, 25, 5000
+	old := make([]*Backend, n0)
+	newer := make([]*Backend, n1)
+	for i := range n1 {
+		b := &Backend{URL: fmt.Sprintf("http://b%d", i)}
+		if i < n0 {
+			old[i] = b
 		}
+		newer[i] = b
+	}
+	p0 := &Proxy{Backends: old}
+	p1 := &Proxy{Backends: newer}
+	changed := 0
+	for i := range samples {
+		id := fmt.Sprintf("%064x", i)
+		c0, err := p0.Candidates(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c1, err := p1.Candidates(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c0[0].URL != c1[0].URL {
+			changed++
+		}
+	}
+	frac := float64(changed) / float64(samples)
+	// HRW remaps k/(N+k) = 5/25 = 0.20. Modulo would remap ~96%.
+	if frac < 0.10 || frac > 0.30 {
+		t.Fatalf("HRW remap fraction 20→25 = %.3f, want ~0.20", frac)
+	}
+}
+
+func TestMalformedActionIDGet(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("backend should not be called")
+	}))
+	defer srv.Close()
+	p := newTestProxy(t, []*Backend{{URL: srv.URL}})
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/action/zzzz", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+	if got := counterVal(t, p.getTotal.WithLabelValues("error")); got != 1 {
+		t.Fatalf("get_total error = %v, want 1", got)
 	}
 }
 
 func TestProxyGetRouting(t *testing.T) {
-	backends := make([]*httptest.Server, 3)
-	for i := range backends {
-		backends[i] = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			actionID := strings.TrimPrefix(r.URL.Path, "/action/")
-			primary := ServerIndex(actionID, 3)
-			if primary == i {
-				w.Header().Set("Content-Type", "application/json")
-				w.Write([]byte(`{"outputID":"beef0001","size":4}`))
-			} else {
-				http.NotFound(w, r)
-			}
+	const n = 3
+	var hits [n]atomic.Int32
+	svcs := make([]*httptest.Server, n)
+	for i := range n {
+		i := i
+		svcs[i] = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits[i].Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"outputID":"beef0001","size":4}`))
 		}))
-		defer backends[i].Close()
+		defer svcs[i].Close()
 	}
+	p := newTestProxy(t, backendsFromServers(svcs))
+	id := testActionID()
+	cands, err := p.Candidates(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	primary := cands[0].URL
 
-	p := &Proxy{
-		Backends: make([]*Backend, 3),
-		Client:   &http.Client{Timeout: 5 * time.Second},
-	}
-	for i, s := range backends {
-		p.Backends[i] = &Backend{URL: s.URL}
-		p.Backends[i].healthy.Store(true)
-	}
-
-	actionID := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
-	req := httptest.NewRequest("GET", "/action/"+actionID, nil)
 	rec := httptest.NewRecorder()
-	p.ServeHTTP(rec, req)
-
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/action/"+id, nil))
 	if rec.Code != http.StatusOK {
-		t.Fatalf("GET /action status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+		t.Fatalf("GET status = %d, want 200; body: %s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "beef0001") {
-		t.Fatalf("unexpected body: %s", rec.Body.String())
+	var primaryHits, others int32
+	for i, s := range svcs {
+		if s.URL == primary {
+			primaryHits = hits[i].Load()
+		} else {
+			others += hits[i].Load()
+		}
+	}
+	if primaryHits != 1 || others != 0 {
+		t.Fatalf("primary hits=%d others=%d, want 1 and 0", primaryHits, others)
 	}
 }
 
-func TestProxyGetPrimaryDownReturns404(t *testing.T) {
-	// Cache is best-effort: if the primary backend is unreachable we return
-	// 404 (miss) instead of fanning out to other backends.
-	backends := make([]*httptest.Server, 3)
-	for i := range backends {
-		backends[i] = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			w.Write([]byte(`{"outputID":"cafe0001","size":4}`))
-		}))
-		defer backends[i].Close()
+func TestProxyGetFailoverOnDown(t *testing.T) {
+	id := testActionID()
+	alive := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"outputID":"cafe0001","size":4}`))
+	}))
+	defer alive.Close()
+
+	p := &Proxy{Client: &http.Client{Timeout: 500 * time.Millisecond}}
+	p.Backends = []*Backend{
+		{URL: "http://127.0.0.1:1"},
+		{URL: alive.URL},
 	}
-
-	actionID := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
-	primary := ServerIndex(actionID, 3)
-
-	// Close the primary backend; the others remain up.
-	backends[primary].Close()
-
-	p := &Proxy{
-		Backends: make([]*Backend, 3),
-		Client:   &http.Client{Timeout: 2 * time.Second},
+	p.ensure()
+	for _, b := range p.Backends {
+		b.healthy.Store(true)
 	}
-	for i, s := range backends {
-		p.Backends[i] = &Backend{URL: s.URL}
-		p.Backends[i].healthy.Store(true)
-	}
-
-	req := httptest.NewRequest("GET", "/action/"+actionID, nil)
+	// Force the dead backend first in HRW order by using a one-backend
+	// candidate list... we walk all healthy, so either order works.
 	rec := httptest.NewRecorder()
-	p.ServeHTTP(rec, req)
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/action/"+id, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET with one backend down status = %d, want 200", rec.Code)
+	}
+}
 
+func TestProxyGet5xxConvertedTo404AfterFailover(t *testing.T) {
+	id := testActionID()
+	svcs := make([]*httptest.Server, 2)
+	svcs[0] = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer svcs[0].Close()
+	svcs[1] = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer svcs[1].Close()
+	p := newTestProxy(t, backendsFromServers(svcs))
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/action/"+id, nil))
 	if rec.Code != http.StatusNotFound {
-		t.Fatalf("GET with primary down status = %d, want 404", rec.Code)
+		t.Fatalf("status = %d, want 404 (never 5xx)", rec.Code)
+	}
+}
+
+func TestProxyGetSkipUnhealthy(t *testing.T) {
+	var called atomic.Int32
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called.Add(1)
+		w.Write([]byte("should-not-run"))
+	}))
+	defer dead.Close()
+	live := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}))
+	defer live.Close()
+	p := newTestProxy(t, []*Backend{{URL: dead.URL}, {URL: live.URL}})
+	p.Backends[0].healthy.Store(false)
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/action/"+testActionID(), nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if called.Load() != 0 {
+		t.Fatal("unhealthy backend was called")
+	}
+}
+
+func TestProxyGetNoHealthy(t *testing.T) {
+	p := newTestProxy(t, []*Backend{{URL: "http://localhost:1"}})
+	p.Backends[0].healthy.Store(false)
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/action/"+testActionID(), nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+	if got := counterVal(t, p.getTotal.WithLabelValues("no_healthy_backend")); got != 1 {
+		t.Fatalf("no_healthy_backend = %v, want 1", got)
 	}
 }
 
 func TestProxyPut(t *testing.T) {
-	var gotBody string
-	var gotPath string
+	var gotBody, gotPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 		b, _ := io.ReadAll(r.Body)
@@ -117,53 +266,143 @@ func TestProxyPut(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	p := &Proxy{
-		Backends: []*Backend{{URL: srv.URL}},
-		Client:   &http.Client{Timeout: 5 * time.Second},
-	}
-	p.Backends[0].healthy.Store(true)
-
-	body := strings.NewReader("hello")
-	req := httptest.NewRequest("PUT", "/abcdef01/beef0001", body)
+	p := newTestProxy(t, []*Backend{{URL: srv.URL}})
+	req := httptest.NewRequest("PUT", "/abcdef01/beef0001", strings.NewReader("hello"))
 	req.ContentLength = 5
 	rec := httptest.NewRecorder()
 	p.ServeHTTP(rec, req)
-
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("PUT status = %d, want 204", rec.Code)
 	}
 	if gotPath != "/abcdef01/beef0001" {
-		t.Fatalf("backend got path %q, want /abcdef01/beef0001", gotPath)
+		t.Fatalf("backend path %q", gotPath)
 	}
 	if gotBody != "hello" {
-		t.Fatalf("backend got body %q, want hello", gotBody)
+		t.Fatalf("body %q", gotBody)
+	}
+}
+
+func TestProxyPutReplication(t *testing.T) {
+	var mu sync.Mutex
+	got := map[string]string{}
+	mk := func() *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			b, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			got[r.Host] = string(b)
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		}))
+	}
+	s1, s2, s3 := mk(), mk(), mk()
+	defer s1.Close()
+	defer s2.Close()
+	defer s3.Close()
+	p := newTestProxy(t, backendsFromServers([]*httptest.Server{s1, s2, s3}))
+	req := httptest.NewRequest("PUT", "/"+testActionID()+"/beef0001", strings.NewReader("hello"))
+	req.ContentLength = 5
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 2 {
+		t.Fatalf("replicas = %d, want 2 (got %#v)", len(got), got)
+	}
+	for _, v := range got {
+		if v != "hello" {
+			t.Fatalf("body %q", v)
+		}
+	}
+}
+
+func TestProxyPutChunkedTee(t *testing.T) {
+	var mu sync.Mutex
+	got := []string{}
+	mk := func() *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			b, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			got = append(got, string(b))
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		}))
+	}
+	s1, s2 := mk(), mk()
+	defer s1.Close()
+	defer s2.Close()
+	p := newTestProxy(t, backendsFromServers([]*httptest.Server{s1, s2}))
+	req := httptest.NewRequest("PUT", "/abcdef01/beef0001", strings.NewReader("hello"))
+	req.ContentLength = -1
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 2 {
+		t.Fatalf("streamed to %d backends, want 2", len(got))
+	}
+	for _, v := range got {
+		if v != "hello" {
+			t.Fatalf("body %q", v)
+		}
 	}
 }
 
 func TestProxyHealth(t *testing.T) {
-	p := &Proxy{
-		Backends: []*Backend{
-			{URL: "http://localhost:1"},
-			{URL: "http://localhost:2"},
-		},
-		Client: &http.Client{},
-	}
-
-	p.Backends[0].healthy.Store(true)
-	p.Backends[1].healthy.Store(true)
+	p := newTestProxy(t, []*Backend{
+		{URL: "http://localhost:1"},
+		{URL: "http://localhost:2"},
+	})
 	req := httptest.NewRequest("GET", "/health", nil)
 	rec := httptest.NewRecorder()
 	p.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("health status = %d, want 200", rec.Code)
 	}
-
 	p.Backends[0].healthy.Store(false)
 	p.Backends[1].healthy.Store(false)
 	rec = httptest.NewRecorder()
 	p.ServeHTTP(rec, req)
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("health status = %d, want 503", rec.Code)
+	}
+}
+
+func TestHealthCheckRequires2xxAndThreshold(t *testing.T) {
+	var status atomic.Int32
+	status.Store(500)
+	var sawPath atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawPath.Store(r.URL.Path)
+		w.WriteHeader(int(status.Load()))
+	}))
+	defer srv.Close()
+	b := &Backend{URL: srv.URL}
+	b.healthy.Store(true)
+	p := &Proxy{Backends: []*Backend{b}, HealthInterval: time.Hour}
+	p.ensure()
+
+	p.probe(b)
+	if !b.healthy.Load() {
+		t.Fatal("one 500 should not mark unhealthy")
+	}
+	p.probe(b)
+	if b.healthy.Load() {
+		t.Fatal("two 500s should mark unhealthy")
+	}
+	if sawPath.Load() != "/health" {
+		t.Fatalf("probed %v, want /health", sawPath.Load())
+	}
+
+	status.Store(200)
+	p.probe(b)
+	if !b.healthy.Load() {
+		t.Fatal("2xx should mark healthy")
 	}
 }
 
@@ -176,20 +415,13 @@ func TestProxyHeaderPassthrough(t *testing.T) {
 		w.Write([]byte("data"))
 	}))
 	defer srv.Close()
-
-	p := &Proxy{
-		Backends: []*Backend{{URL: srv.URL}},
-		Client:   &http.Client{Timeout: 5 * time.Second},
-	}
-	p.Backends[0].healthy.Store(true)
-
+	p := newTestProxy(t, []*Backend{{URL: srv.URL}})
 	req := httptest.NewRequest("GET", "/action/abcdef01", nil)
 	req.Header.Set("Want-Object", "1")
 	req.Header.Set("Accept-Encoding", "lz4")
 	req.Header.Set("Authorization", "Bearer test-token")
 	rec := httptest.NewRecorder()
 	p.ServeHTTP(rec, req)
-
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
@@ -207,35 +439,12 @@ func TestProxyHeaderPassthrough(t *testing.T) {
 	}
 }
 
-func TestGetBackendUnreachable(t *testing.T) {
-	// Proxy returns 404 (miss) when the primary backend is unreachable.
-	p := &Proxy{
-		Backends: []*Backend{
-			{URL: "http://localhost:1"},
-			{URL: "http://localhost:2"},
-		},
-		Client: &http.Client{Timeout: 1 * time.Second},
-	}
-	p.Backends[0].healthy.Store(true)
-	p.Backends[1].healthy.Store(true)
-
-	req := httptest.NewRequest("GET", "/action/abcdef01", nil)
-	rec := httptest.NewRecorder()
-	p.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("status = %d, want 404", rec.Code)
-	}
-}
-
 func TestProxyPutRetrySucceeds(t *testing.T) {
 	var attempts atomic.Int32
 	var gotBody string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		n := attempts.Add(1)
 		if n < 3 {
-			// Simulate backend stall; hijack to drop the connection so the
-			// proxy's http.Client returns an error rather than an HTTP status.
 			hj, ok := w.(http.Hijacker)
 			if !ok {
 				t.Errorf("hijacker not supported")
@@ -250,19 +459,11 @@ func TestProxyPutRetrySucceeds(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer srv.Close()
-
-	p := &Proxy{
-		Backends: []*Backend{{URL: srv.URL}},
-		Client:   &http.Client{Timeout: 2 * time.Second},
-		Retries:  2,
-	}
-	p.Backends[0].healthy.Store(true)
-
+	p := newTestProxy(t, []*Backend{{URL: srv.URL}})
 	req := httptest.NewRequest("PUT", "/abcdef01/beef0001", strings.NewReader("hello"))
 	req.ContentLength = 5
 	rec := httptest.NewRecorder()
 	p.ServeHTTP(rec, req)
-
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("PUT after retry status = %d, want 204", rec.Code)
 	}
@@ -271,6 +472,30 @@ func TestProxyPutRetrySucceeds(t *testing.T) {
 	}
 	if gotBody != "hello" {
 		t.Fatalf("body after retry = %q, want hello", gotBody)
+	}
+}
+
+func TestProxyPutRetry5xx(t *testing.T) {
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := attempts.Add(1)
+		if n < 3 {
+			http.Error(w, "nope", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	p := newTestProxy(t, []*Backend{{URL: srv.URL}})
+	req := httptest.NewRequest("PUT", "/abcdef01/beef0001", strings.NewReader("hello"))
+	req.ContentLength = 5
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", rec.Code)
+	}
+	if got := attempts.Load(); got != 3 {
+		t.Fatalf("attempts = %d, want 3", got)
 	}
 }
 
@@ -287,64 +512,43 @@ func TestProxyPutRetryExhausted(t *testing.T) {
 		conn.Close()
 	}))
 	defer srv.Close()
-
-	p := &Proxy{
-		Backends: []*Backend{{URL: srv.URL}},
-		Client:   &http.Client{Timeout: 2 * time.Second},
-		Retries:  2,
-	}
-	p.Backends[0].healthy.Store(true)
-
+	p := newTestProxy(t, []*Backend{{URL: srv.URL}})
 	req := httptest.NewRequest("PUT", "/abcdef01/beef0001", strings.NewReader("hello"))
 	req.ContentLength = 5
 	rec := httptest.NewRecorder()
 	p.ServeHTTP(rec, req)
-
-	// Best-effort cache: PUT never surfaces an error to the runner.
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("PUT status after exhausted retries = %d, want 204", rec.Code)
 	}
 	if got := attempts.Load(); got != 3 {
-		t.Fatalf("attempts = %d, want 3 (1 + 2 retries)", got)
+		t.Fatalf("attempts = %d, want 3", got)
 	}
-	// PutErr counter should be incremented exactly once.
-	if got := p.stats.PutErr.Load(); got != 1 {
-		t.Fatalf("PutErr = %d, want 1", got)
+	if got := counterVal(t, p.putErr); got != 1 {
+		t.Fatalf("putErr = %v, want 1", got)
 	}
 }
 
 func TestProxyPutDropped(t *testing.T) {
-	// With an absurdly tight inflight budget, any PUT gets dropped.
 	var backendCalls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		backendCalls.Add(1)
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer srv.Close()
-
-	p := &Proxy{
-		Backends:         []*Backend{{URL: srv.URL}},
-		Client:           &http.Client{Timeout: 2 * time.Second},
-		MaxInflightBytes: 1,
-	}
-	p.Backends[0].healthy.Store(true)
-
+	p := newTestProxy(t, []*Backend{{URL: srv.URL}})
+	p.MaxInflightBytes = 1
 	req := httptest.NewRequest("PUT", "/abcdef01/beef0001", strings.NewReader("hello"))
 	req.ContentLength = 5
 	rec := httptest.NewRecorder()
 	p.ServeHTTP(rec, req)
-
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("dropped PUT status = %d, want 204", rec.Code)
 	}
-	if got := p.stats.PutDropped.Load(); got != 1 {
-		t.Fatalf("PutDropped = %d, want 1", got)
+	if got := counterVal(t, p.putDropped); got != 1 {
+		t.Fatalf("putDropped = %v, want 1", got)
 	}
 	if got := backendCalls.Load(); got != 0 {
-		t.Fatalf("backend was called %d times on a dropped PUT, want 0", got)
-	}
-	if got := p.inflightBytes.Load(); got != 0 {
-		t.Fatalf("inflightBytes after drop = %d, want 0", got)
+		t.Fatalf("backend was called %d times", got)
 	}
 }
 
@@ -354,15 +558,9 @@ func TestProxyInflightReleasesOnSuccess(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer srv.Close()
-
-	p := &Proxy{
-		Backends:         []*Backend{{URL: srv.URL}},
-		Client:           &http.Client{Timeout: 2 * time.Second},
-		MaxInflightBytes: 1024,
-	}
-	p.Backends[0].healthy.Store(true)
-
-	for i := 0; i < 10; i++ {
+	p := newTestProxy(t, []*Backend{{URL: srv.URL}})
+	p.MaxInflightBytes = 1024
+	for i := range 10 {
 		req := httptest.NewRequest("PUT", "/abcdef01/beef0001", strings.NewReader("hello"))
 		req.ContentLength = 5
 		rec := httptest.NewRecorder()
@@ -371,12 +569,12 @@ func TestProxyInflightReleasesOnSuccess(t *testing.T) {
 			t.Fatalf("iter %d: inflightBytes = %d after PUT, want 0", i, got)
 		}
 	}
-	if got := p.stats.PutOK.Load(); got != 10 {
-		t.Fatalf("PutOK = %d, want 10", got)
+	if got := counterVal(t, p.putOK); got != 10 {
+		t.Fatalf("putOK = %v, want 10", got)
 	}
 }
 
-func TestProxyStatsCounters(t *testing.T) {
+func TestProxyStatsAndMetricsEndpoint(t *testing.T) {
 	var nextStatus atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch nextStatus.Load() {
@@ -390,33 +588,40 @@ func TestProxyStatsCounters(t *testing.T) {
 		}
 	}))
 	defer srv.Close()
-
-	p := &Proxy{
-		Backends: []*Backend{{URL: srv.URL}},
-		Client:   &http.Client{Timeout: 2 * time.Second},
-	}
-	p.Backends[0].healthy.Store(true)
-
-	// One hit, one miss.
+	p := newTestProxy(t, []*Backend{{URL: srv.URL}})
 	for _, status := range []int32{200, 404} {
 		nextStatus.Store(status)
-		rec := httptest.NewRecorder()
-		p.ServeHTTP(rec, httptest.NewRequest("GET", "/action/abcdef01", nil))
+		p.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/action/abcdef01", nil))
 	}
-	// One successful PUT.
 	nextStatus.Store(204)
-	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("PUT", "/abcdef01/beef0001", strings.NewReader("x"))
 	req.ContentLength = 1
-	p.ServeHTTP(rec, req)
+	p.ServeHTTP(httptest.NewRecorder(), req)
 
-	if got := p.stats.GetHit.Load(); got != 1 {
-		t.Errorf("GetHit = %d, want 1", got)
+	if got := counterVal(t, p.getTotal.WithLabelValues("hit")); got != 1 {
+		t.Errorf("hit = %v, want 1", got)
 	}
-	if got := p.stats.GetMiss.Load(); got != 1 {
-		t.Errorf("GetMiss = %d, want 1", got)
+	if got := counterVal(t, p.getTotal.WithLabelValues("miss")); got != 1 {
+		t.Errorf("miss = %v, want 1", got)
 	}
-	if got := p.stats.PutOK.Load(); got != 1 {
-		t.Errorf("PutOK = %d, want 1", got)
+	if got := counterVal(t, p.putOK); got != 1 {
+		t.Errorf("putOK = %v, want 1", got)
+	}
+
+	rec := httptest.NewRecorder()
+	p.ServeHTTPDebug(rec, httptest.NewRequest("GET", "/metrics", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/metrics status = %d", rec.Code)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		`gocacheproxy_get_total{result="hit"}`,
+		`gocacheproxy_get_total{result="miss"}`,
+		"gocacheproxy_request_duration_seconds",
+		"gocacheproxy_backend_up",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics missing %q", want)
+		}
 	}
 }

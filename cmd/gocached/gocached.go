@@ -6,10 +6,10 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
-	"maps"
 	"net"
 	"net/http"
 	"os"
@@ -23,12 +23,19 @@ import (
 
 var (
 	dir         = flag.String("cache-dir", "", "cache directory, if empty defaults to <UserCacheDir>/gocached")
+	sqliteDir   = flag.String("sqlite-dir", "", "directory for the SQLite metadata database; if empty, defaults to the cache directory")
+	hotDir      = flag.String("hot-dir", "", "if non-empty, enable storage tiering with this directory as a fast tier (e.g. local NVMe) holding a bounded copy of recently used blobs; the cache directory remains the source of truth")
+	hotCapacity = flag.Int("hot-capacity-gb", 600, "maximum size of the hot tier directory in GiB; only used with --hot-dir")
 	verbose     = flag.Bool("verbose", false, "be verbose")
 	listen      = flag.String("listen", ":31364", "listen address for the build-facing HTTP server")
 	debugListen = flag.String("debug-listen", "", "if non-empty, listen address for the debug HTTP server (pprof, metrics, etc)")
 
 	maxSize = flag.Int("max-size-gb", 50, "maximum size of the cache in GiB; 0 means no limit")
 	maxAge  = flag.Int("max-age-days", 60, "maximum age of objects in the cache in days; 0 means no limit")
+
+	globalGeneration = flag.Int("global-generation", 1, "generation number of the global namespace; incrementing it effectively wipes the global namespace, with the old generation's objects aging out via normal LRU eviction")
+
+	shardPrefixLen = flag.Int("shard-prefix-len", 2, "number of SHA256 hex characters per usage-stats shard key (valid 1..4); total shards = 16^n. Defaults to 2 (256 shards). Increase if a single shard's stats scan becomes too slow on a large DB")
 
 	jwtIssuer = flag.String("jwt-issuer", "", "the issuer to trust JWTs from; if set, all requests will require auth, and must set at least one -jwt-claim")
 	// See example GitHub token claims for what can be available:
@@ -64,9 +71,22 @@ func main() {
 
 	opts := []gocached.ServerOption{
 		gocached.WithDir(*dir),
+		gocached.WithSQLiteDir(*sqliteDir),
 		gocached.WithVerbose(*verbose),
 		gocached.WithMaxSize(int64(*maxSize) << 30),
 		gocached.WithMaxAge(time.Duration(*maxAge) * 24 * time.Hour),
+		gocached.WithShardPrefixLen(*shardPrefixLen),
+		gocached.WithGlobalGeneration(*globalGeneration),
+	}
+
+	if *hotDir != "" {
+		if *hotCapacity <= 0 {
+			log.Fatal("--hot-capacity-gb must be positive when --hot-dir is set")
+		}
+		opts = append(opts,
+			gocached.WithHotDir(*hotDir),
+			gocached.WithHotCapacity(int64(*hotCapacity)<<30),
+		)
 	}
 
 	if *jwtIssuer != "" {
@@ -74,15 +94,33 @@ func main() {
 			log.Fatal("must specify --jwt-claim at least once when --jwt-issuer is set")
 		}
 
-		globalClaims := map[string]string{}
-		maps.Copy(globalClaims, jwtClaims)
-		maps.Copy(globalClaims, globalJWTClaims)
-
-		opts = append(opts, gocached.WithJWTAuth(gocached.JWTIssuerConfig{
-			Issuer:            *jwtIssuer,
-			RequiredClaims:    jwtClaims,
-			GlobalWriteClaims: globalClaims,
-		}))
+		opts = append(opts,
+			gocached.WithJWTAuth(*jwtIssuer),
+			gocached.WithNamespaceMapping(func(ctx context.Context, claims map[string]any) (*gocached.NamespaceGrant, error) {
+				var ns gocached.Namespace
+				for k, want := range jwtClaims {
+					if got := claims[k]; got != want {
+						return nil, fmt.Errorf("claim %q = %v, want %v", k, got, want)
+					}
+					if ns != "" {
+						ns += ","
+					}
+					ns += gocached.Namespace(fmt.Sprintf("%s=%s", k, want))
+				}
+				for k, want := range globalJWTClaims {
+					if got := claims[k]; got != want {
+						return &gocached.NamespaceGrant{
+							WriteNamespace:     &ns,
+							ExtraReadNamespace: &ns,
+						}, nil
+					}
+				}
+				return &gocached.NamespaceGrant{
+					WriteNamespace:     new(gocached.GlobalNamespace),
+					ExtraReadNamespace: &ns,
+				}, nil
+			}),
+		)
 	}
 
 	srv, err := gocached.NewServer(opts...)

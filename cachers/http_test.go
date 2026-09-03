@@ -5,12 +5,16 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strconv"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"github.com/pierrec/lz4/v4"
 )
@@ -191,6 +195,211 @@ func TestHTTPClientPutServerRejectsBody(t *testing.T) {
 			}
 		})
 	}
+}
+
+// blockingPutTransport is a fake http.RoundTripper whose PUTs block until
+// release is closed. It counts how many round trips have started, letting tests
+// observe in-flight uploads without a real network or wall-clock timing. It is
+// safe to use inside a synctest bubble because it performs no real I/O.
+type blockingPutTransport struct {
+	started atomic.Int64
+	release chan struct{}
+}
+
+func newBlockingPutTransport() *blockingPutTransport {
+	return &blockingPutTransport{
+		release: make(chan struct{}),
+	}
+}
+
+func (tr *blockingPutTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	tr.started.Add(1)
+	select {
+	case <-tr.release:
+	case <-req.Context().Done():
+		return nil, req.Context().Err()
+	}
+	io.Copy(io.Discard, req.Body)
+	return &http.Response{
+		StatusCode: http.StatusNoContent,
+		Body:       http.NoBody,
+		Header:     make(http.Header),
+	}, nil
+}
+
+// TestHTTPClientAsyncPutConcurrencyLimit verifies that no more than
+// AsyncPutMaxConcurrent uploads run at once, and that PUTs beyond the cap are
+// queued.
+func TestHTTPClientAsyncPutConcurrencyLimit(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		tr := newBlockingPutTransport()
+		hc := &HTTPClient{
+			BaseURL:               "http://fake",
+			Disk:                  &DiskCache{Dir: t.TempDir()},
+			HTTPClient:            &http.Client{Transport: tr},
+			BestEffortHTTP:        true,
+			AsyncPutMaxConcurrent: 2,
+		}
+
+		data := []byte("some cached output")
+		for i := range 5 {
+			id := strconv.Itoa(i)
+			diskPath, err := hc.Put(t.Context(), "aaaa"+id, "bbbb"+id, int64(len(data)), bytes.NewReader(data))
+			if err != nil {
+				t.Fatalf("Put %d returned error: %v", i, err)
+			}
+			if diskPath == "" {
+				t.Fatalf("Put %d returned empty diskPath", i)
+			}
+		}
+
+		// Only 2 uploads may run at once; the other 3 wait for a slot.
+		synctest.Wait()
+		if got := tr.started.Load(); got != 2 {
+			t.Errorf("started %d uploads, want 2", got)
+		}
+
+		// Releasing the blocked uploads lets the queued ones drain until all 5
+		// have run.
+		close(tr.release)
+		synctest.Wait()
+		if got := tr.started.Load(); got != 5 {
+			t.Errorf("started %d uploads after release, want 5", got)
+		}
+	})
+}
+
+// TestHTTPClientShutdownDrains verifies Shutdown blocks until in-flight PUTs
+// finish and returns true when they drain in time.
+func TestHTTPClientShutdownDrains(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		tr := newBlockingPutTransport()
+		hc := &HTTPClient{
+			BaseURL:        "http://fake",
+			Disk:           &DiskCache{Dir: t.TempDir()},
+			HTTPClient:     &http.Client{Transport: tr},
+			BestEffortHTTP: true,
+		}
+
+		data := []byte("some cached output")
+		if _, err := hc.Put(t.Context(), "aabbccdd", "eeff0011", int64(len(data)), bytes.NewReader(data)); err != nil {
+			t.Fatalf("Put returned error: %v", err)
+		}
+		synctest.Wait()
+		if got := tr.started.Load(); got != 1 {
+			t.Fatalf("started %d uploads, want 1", got)
+		}
+
+		shutdownReturned := make(chan bool, 1)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			shutdownReturned <- hc.Shutdown(ctx)
+		}()
+
+		// With the upload still blocked, Shutdown must not return.
+		synctest.Wait()
+		select {
+		case <-shutdownReturned:
+			t.Fatal("Shutdown returned before the in-flight PUT finished")
+		default:
+		}
+
+		close(tr.release)
+		synctest.Wait()
+		select {
+		case drained := <-shutdownReturned:
+			if !drained {
+				t.Error("Shutdown returned drained=false, want true")
+			}
+		default:
+			t.Fatal("Shutdown did not return after the PUT was released")
+		}
+	})
+}
+
+// TestHTTPClientShutdownCancelsStragglers verifies that when the drain deadline
+// elapses, Shutdown returns false and cancels the context shared by background
+// PUTs, so an upload blocked past the deadline is abandoned rather than left to
+// outlive Shutdown.
+func TestHTTPClientShutdownCancelsStragglers(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		tr := newBlockingPutTransport() // never released
+		hc := &HTTPClient{
+			BaseURL:        "http://fake",
+			Disk:           &DiskCache{Dir: t.TempDir()},
+			HTTPClient:     &http.Client{Transport: tr},
+			BestEffortHTTP: true,
+		}
+
+		data := []byte("some cached output")
+		if _, err := hc.Put(t.Context(), "aabbccdd", "eeff0011", int64(len(data)), bytes.NewReader(data)); err != nil {
+			t.Fatalf("Put returned error: %v", err)
+		}
+		synctest.Wait()
+		if got := tr.started.Load(); got != 1 {
+			t.Fatalf("started %d uploads, want 1", got)
+		}
+
+		// The upload never unblocks, so Shutdown must hit its deadline, cancel
+		// the shared context, and report that it did not drain.
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if drained := hc.Shutdown(ctx); drained {
+			t.Error("Shutdown returned drained=true, want false")
+		}
+
+		// Canceling the shared context unblocks the straggler, so the
+		// background goroutine exits rather than leaking.
+		synctest.Wait()
+		if got := hc.PutsCanceled.Load(); got != 1 {
+			t.Errorf("PutsCanceled = %d, want 1", got)
+		}
+		if got := hc.PutsTimedOut.Load(); got != 0 {
+			t.Errorf("PutsTimedOut = %d, want 0", got)
+		}
+	})
+}
+
+// TestHTTPClientAsyncPutTimeout verifies that AsyncPutTimeout is applied per
+// object size and that a PUT canceled by its own timeout is counted by
+// PutsTimedOut.
+func TestHTTPClientAsyncPutTimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		tr := newBlockingPutTransport() // never released
+		var gotSize int64
+		hc := &HTTPClient{
+			BaseURL:        "http://fake",
+			Disk:           &DiskCache{Dir: t.TempDir()},
+			HTTPClient:     &http.Client{Transport: tr},
+			BestEffortHTTP: true,
+			AsyncPutTimeout: func(size int64) time.Duration {
+				gotSize = size
+				return time.Second
+			},
+		}
+
+		data := []byte("some cached output")
+		if _, err := hc.Put(t.Context(), "aabbccdd", "eeff0011", int64(len(data)), bytes.NewReader(data)); err != nil {
+			t.Fatalf("Put returned error: %v", err)
+		}
+
+		// The upload never unblocks, so its own timeout must fire and count it
+		// as timed out without any call to Shutdown. Sleeping past the timeout
+		// durably blocks this goroutine so the bubble's fake clock advances and
+		// the 1s timer fires.
+		time.Sleep(2 * time.Second)
+		synctest.Wait()
+		if gotSize != int64(len(data)) {
+			t.Errorf("AsyncPutTimeout called with size %d, want %d", gotSize, len(data))
+		}
+		if got := hc.PutsTimedOut.Load(); got != 1 {
+			t.Errorf("PutsTimedOut = %d, want 1", got)
+		}
+		if got := hc.PutsCanceled.Load(); got != 0 {
+			t.Errorf("PutsCanceled = %d, want 0", got)
+		}
+	})
 }
 
 func TestHTTPClientBestEffort(t *testing.T) {

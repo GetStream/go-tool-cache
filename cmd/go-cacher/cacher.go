@@ -6,6 +6,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -21,6 +22,10 @@ import (
 	"github.com/GetStream/go-tool-cache/cacheproc"
 	"github.com/GetStream/go-tool-cache/cachers"
 )
+
+// shutdownDrainTimeout bounds how long Close waits for background PUTs to drain
+// before abandoning them.
+const shutdownDrainTimeout = 5 * time.Second
 
 var (
 	dir        = flag.String("cache-dir", "", "cache directory; empty means automatic")
@@ -52,16 +57,22 @@ func main() {
 
 	var p *cacheproc.Process
 	p = &cacheproc.Process{
-		Close: func() error {
-			if *verbose {
-				log.Printf("cacher: closing; %d gets (%d hits, %d misses, %d errors); %d puts (%d errors)",
-					p.Gets.Load(), p.GetHits.Load(), p.GetMisses.Load(), p.GetErrors.Load(), p.Puts.Load(), p.PutErrors.Load())
-			}
-			return nil
-		},
 		Get: dc.Get,
 		Put: dc.Put,
 	}
+	var hc *cachers.HTTPClient
+	statsFunc := func() error {
+		if *verbose {
+			putDetail := fmt.Sprintf("%d errors", p.PutErrors.Load())
+			if hc != nil {
+				putDetail += fmt.Sprintf(", %d timed out, %d canceled", hc.PutsTimedOut.Load(), hc.PutsCanceled.Load())
+			}
+			log.Printf("cacher: closing; %d gets (%d hits, %d misses, %d errors); %d puts (%s)",
+				p.Gets.Load(), p.GetHits.Load(), p.GetMisses.Load(), p.GetErrors.Load(), p.Puts.Load(), putDetail)
+		}
+		return nil
+	}
+	p.Close = statsFunc
 
 	if *gwPort != 0 {
 		if gw, ok := getGatewayIP(); ok {
@@ -91,8 +102,7 @@ func main() {
 			urls[i] = u
 		}
 		if len(urls) == 1 {
-			// Single server: use existing HTTPClient directly (no regression)
-			hc := &cachers.HTTPClient{
+			hc = &cachers.HTTPClient{
 				BaseURL:     urls[0],
 				Disk:        dc,
 				Verbose:     *verbose,
@@ -100,8 +110,8 @@ func main() {
 			}
 			p.Get = hc.Get
 			p.Put = hc.Put
+			p.Close = shutdownHTTP(hc, statsFunc)
 		} else {
-			// Multiple servers: use MultiHTTPClient with consistent hashing
 			clients := make([]*cachers.HTTPClient, len(urls))
 			for i, u := range urls {
 				clients[i] = &cachers.HTTPClient{
@@ -119,11 +129,35 @@ func main() {
 			}
 			p.Get = mc.Get
 			p.Put = mc.Put
+			p.Close = func() error {
+				ctx, cancel := context.WithTimeout(context.Background(), shutdownDrainTimeout)
+				defer cancel()
+				for _, c := range clients {
+					if !c.Shutdown(ctx) {
+						log.Printf("go-cacher: timed out waiting for background PUTs to drain (%s)", c.BaseURL)
+					}
+				}
+				return statsFunc()
+			}
 		}
 	}
 
 	if err := p.Run(); err != nil {
 		log.Fatal(err)
+	}
+}
+
+func shutdownHTTP(hc *cachers.HTTPClient, statsFunc func() error) func() error {
+	return func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownDrainTimeout)
+		defer cancel()
+		if !hc.Shutdown(ctx) {
+			log.Printf("go-cacher: timed out waiting for background PUTs to drain")
+		}
+		if timedOut, canceled := hc.PutsTimedOut.Load(), hc.PutsCanceled.Load(); timedOut+canceled > 0 {
+			log.Printf("go-cacher: %d background PUTs timed out, %d canceled", timedOut, canceled)
+		}
+		return statsFunc()
 	}
 }
 

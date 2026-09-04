@@ -15,6 +15,7 @@ the "Want-Object: 1" header variant on the GET request.
 
 	GET /action/<actionID-hex>
 	Want-Object: 1
+	Go-Action-Kind: compile   (optional; from patched cmd/go)
 
 	200 OK
 	Content-Type: application/octet-stream
@@ -27,6 +28,7 @@ And to insert an object:
 
 	PUT /<actionID>/<outputID>
 	Content-Length: 1234
+	Go-Action-Kind: compile   (optional)
 
 	<bytes>
 
@@ -63,6 +65,7 @@ import (
 
 	ijwt "github.com/GetStream/go-tool-cache/gocached/internal/jwt"
 	"github.com/GetStream/go-tool-cache/gocached/logger"
+	"github.com/GetStream/go-tool-cache/wire"
 	"github.com/pierrec/lz4/v4"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
@@ -89,6 +92,11 @@ const (
 	// gocachedAudience is the audience we require JWTs to have. Could be
 	// configurable in future, but for now just needs to be specific to gocached.
 	gocachedAudience = "gocached"
+
+	// healthPath is a liveness endpoint on the main listener. gocacheproxy
+	// polls it to decide whether a backend may take traffic, so it must stay
+	// unauthenticated and must not require the debug listener to be enabled.
+	healthPath = "/health"
 )
 
 func init() {
@@ -241,7 +249,7 @@ func openDB(dbDir string) (*sql.DB, error) {
 	numConns := min(runtime.NumCPU(), 4)
 	db.SetMaxOpenConns(numConns)
 	db.SetMaxIdleConns(numConns)
-	db.SetConnMaxLifetime(0) // no limit
+	db.SetConnMaxLifetime(0)          // no limit
 	if err := db.Ping(); err != nil { // triggers connection hook to run schema
 		return nil, err
 	}
@@ -446,14 +454,14 @@ func (srv *Server) start() error {
 	reqLatencyBuckets := []float64{0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2}
 	srv.getDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "gocached_get_duration_seconds",
-		Help:    "wall time of each cache get request, labeled by storage path: hot (hot tier disk), disk, inline, pending (put-queue), none (HEAD request), or error; and type: get (hit), miss (404), or error",
+		Help:    "wall time of each cache get request, labeled by storage path: hot (hot tier disk), disk, inline, pending (put-queue), none (HEAD request), or error; type: get (hit), miss (404), or error; and action_kind when the client sent Go-Action-Kind",
 		Buckets: reqLatencyBuckets,
-	}, []string{"storage", "type"})
+	}, []string{"storage", "type", "action_kind"})
 	srv.putDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "gocached_put_duration_seconds",
-		Help:    "wall time of each cache put request, labeled by storage path: disk, inline, or error; and type: put (success), dup, or error",
+		Help:    "wall time of each cache put request, labeled by storage path: disk, inline, or error; type: put (success), dup, or error; and action_kind when the client sent Go-Action-Kind",
 		Buckets: reqLatencyBuckets,
-	}, []string{"storage", "type"})
+	}, []string{"storage", "type", "action_kind"})
 	blobSizeBuckets := []float64{1}
 	for i := 6; i <= 30; i += 2 {
 		bucket := 1 << i
@@ -461,9 +469,13 @@ func (srv *Server) start() error {
 	}
 	srv.blobSize = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "gocached_blob_size_bytes",
-		Help:    "object size in bytes transmitted on the wire (whether compressed or uncompressed) for successful GETs and PUTs, labeled by storage: hot, disk, inline, or error; and type: get, put, or dup",
+		Help:    "object size in bytes transmitted on the wire (whether compressed or uncompressed) for successful GETs and PUTs, labeled by storage: hot, disk, inline, or error; type: get, put, or dup; and action_kind when the client sent Go-Action-Kind",
 		Buckets: blobSizeBuckets,
-	}, []string{"storage", "type"})
+	}, []string{"storage", "type", "action_kind"})
+	srv.evictionsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "gocached_evictions_total",
+		Help: "blobs evicted by the cleanup loop, labeled by the pressure that triggered the tick (age vs size)",
+	}, []string{"reason"})
 
 	// Fill the namespace ID cache.
 	rows, err := srv.db.Query("SELECT NamespaceID, Namespace FROM Namespaces")
@@ -505,7 +517,7 @@ func (srv *Server) start() error {
 		collectors.NewBuildInfoCollector(),
 	)
 	srv.registerMetrics(reg)
-	reg.MustRegister(srv.shardScanDuration, srv.getDuration, srv.putDuration, srv.blobSize)
+	reg.MustRegister(srv.shardScanDuration, srv.getDuration, srv.putDuration, srv.blobSize, srv.evictionsTotal)
 
 	// Per-scrape gauges for shard stats loop health. GaugeFunc recomputes on
 	// every Prometheus scrape, so the values stay fresh between scans
@@ -1050,6 +1062,10 @@ type Server struct {
 	putDuration *prometheus.HistogramVec
 	blobSize    *prometheus.HistogramVec
 
+	// evictionsTotal counts blobs removed by the cleanup loop, labeled by
+	// whether the tick ran because of maxAge or maxSize pressure.
+	evictionsTotal *prometheus.CounterVec
+
 	// Metrics. Exported fields for reflection, but within a private struct
 	// field to control the gocached Server API surface.
 	m struct {
@@ -1198,6 +1214,13 @@ func (srv *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		srv.logf("ServeHTTP: %s %s", r.Method, r.RequestURI)
 	}
 
+	// Answered before auth and before request stats: a health probe is not
+	// cache traffic and its caller holds no session.
+	if r.URL.Path == healthPath {
+		srv.serveHealth(w, r)
+		return
+	}
+
 	var sessionData *sessionData // remains nil for unauthenticated requests.
 	reqStats := &stats{}
 	defer func() {
@@ -1207,7 +1230,8 @@ func (srv *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Handle session auth first if enabled.
 	if srv.jwtValidator != nil {
-		// If JWT auth enabled, this is the only unauthenticated (non-debug) endpoint.
+		// If JWT auth enabled, this is the only unauthenticated cache endpoint
+		// besides GET/HEAD /health (answered above).
 		if r.Method == "POST" && r.URL.Path == "/auth/exchange-token" {
 			srv.handleTokenExchange(w, r)
 			return
@@ -1260,6 +1284,23 @@ func (srv *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Error(w, "not found", http.StatusNotFound)
+}
+
+// serveHealth reports that this server is up and serving. It deliberately
+// checks nothing else: a shard whose disk or SQLite is degraded still serves
+// reads better than no shard at all, and taking it out of the ring would
+// reshuffle keys across the whole cluster.
+func (srv *Server) serveHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" && r.Method != "HEAD" {
+		http.Error(w, "bad method", http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	if r.Method == "HEAD" {
+		return
+	}
+	io.WriteString(w, "ok\n")
 }
 
 func (srv *Server) getSessionData(token string) (*sessionData, bool) {
@@ -1325,6 +1366,10 @@ type actionKey struct {
 	ActionID    string
 }
 
+func requestActionKind(r *http.Request) string {
+	return wire.SanitizeActionKind(r.Header.Get(wire.ActionKindHeader))
+}
+
 func validHex(x string) bool {
 	if len(x) < 4 || len(x) > 1000 || len(x)%2 == 1 {
 		return false
@@ -1364,11 +1409,12 @@ func (srv *Server) handleGetAction(w http.ResponseWriter, r *http.Request, stats
 	defer srv.m.ActiveGets.Add(-1)
 
 	start := srv.now()
+	kind := requestActionKind(r)
 	labels := writeObjectResponseLabels{storage: "error", result: "error"}
 	defer func() {
 		d := srv.now().Sub(start)
 		stats.GetNanos += d.Nanoseconds()
-		srv.getDuration.WithLabelValues(labels.storage, labels.result).Observe(d.Seconds())
+		srv.getDuration.WithLabelValues(labels.storage, labels.result, kind).Observe(d.Seconds())
 	}()
 	stats.Gets++
 	ctx := r.Context()
@@ -1536,6 +1582,7 @@ func (l *writeObjectResponseLabels) markPending() {
 // metric.
 func (srv *Server) writeObjectResponse(w http.ResponseWriter, r *http.Request, stats *stats, src objectSource) (labels writeObjectResponseLabels) {
 	labels = writeObjectResponseLabels{storage: "error", result: "get"}
+	kind := requestActionKind(r)
 
 	outputID := cmp.Or(src.altOutputID, src.sha256hex)
 	isLZ4 := src.storedSize != src.uncompressedSize
@@ -1567,7 +1614,7 @@ func (srv *Server) writeObjectResponse(w http.ResponseWriter, r *http.Request, s
 		stats.GetHitsInline++
 		stats.GetBytes += src.storedSize
 		labels.storage = "inline"
-		srv.blobSize.WithLabelValues(labels.storage, labels.result).Observe(float64(src.storedSize))
+		srv.blobSize.WithLabelValues(labels.storage, labels.result, kind).Observe(float64(src.storedSize))
 		w.Write(src.smallData)
 		return
 	}
@@ -1602,11 +1649,11 @@ func (srv *Server) writeObjectResponse(w http.ResponseWriter, r *http.Request, s
 	if isLZ4 && !clientAcceptsLZ4 {
 		// Client doesn't accept lz4; decompress on the fly.
 		stats.GetBytes += src.uncompressedSize
-		srv.blobSize.WithLabelValues(labels.storage, labels.result).Observe(float64(src.uncompressedSize))
+		srv.blobSize.WithLabelValues(labels.storage, labels.result, kind).Observe(float64(src.uncompressedSize))
 		io.Copy(w, lz4.NewReader(rc))
 	} else {
 		stats.GetBytes += src.storedSize
-		srv.blobSize.WithLabelValues(labels.storage, labels.result).Observe(float64(src.storedSize))
+		srv.blobSize.WithLabelValues(labels.storage, labels.result, kind).Observe(float64(src.storedSize))
 		io.Copy(w, rc)
 	}
 	return
@@ -1914,12 +1961,13 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, stats *stats,
 	defer s.m.ActivePuts.Add(-1)
 
 	start := s.now()
+	kind := requestActionKind(r)
 	storage := "error"
 	result := "error"
 	defer func() {
 		d := s.now().Sub(start)
 		stats.PutsNanos += d.Nanoseconds()
-		s.putDuration.WithLabelValues(storage, result).Observe(d.Seconds())
+		s.putDuration.WithLabelValues(storage, result, kind).Observe(d.Seconds())
 	}()
 
 	if r.Method != "PUT" {
@@ -2043,7 +2091,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, stats *stats,
 	} else {
 		storage = "disk"
 	}
-	s.blobSize.WithLabelValues(storage, result).Observe(float64(r.ContentLength))
+	s.blobSize.WithLabelValues(storage, result, kind).Observe(float64(r.ContentLength))
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -2949,7 +2997,15 @@ func (srv *Server) cleanupTick(ctx context.Context) (countAndSize, error) {
 	if !overAge && overSize {
 		maxBytes = all.Size - srv.maxSize
 	}
-	return srv.evictOldestActions(ctx, cutoff, cleanupBatchSize, maxBytes)
+	ret, err := srv.evictOldestActions(ctx, cutoff, cleanupBatchSize, maxBytes)
+	if err == nil && ret.Count > 0 && srv.evictionsTotal != nil {
+		reason := "size"
+		if overAge {
+			reason = "age"
+		}
+		srv.evictionsTotal.WithLabelValues(reason).Add(float64(ret.Count))
+	}
+	return ret, err
 }
 
 // checkpointTruncate runs PRAGMA wal_checkpoint(TRUNCATE) and returns SQLite's

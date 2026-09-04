@@ -112,7 +112,7 @@ func (p *Process) Run() error {
 		}
 		go func() {
 			res := &wire.Response{ID: req.ID}
-			ctx := ctx // TODO: include req ID as a context.Value for tracing?
+			ctx := wire.ContextWithActionKind(ctx, req.ActionKind)
 			if err := p.handleRequest(ctx, &req, res); err != nil {
 				res.Err = err.Error()
 			}

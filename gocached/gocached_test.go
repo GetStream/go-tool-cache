@@ -29,10 +29,13 @@ import (
 	"time"
 
 	"github.com/GetStream/go-tool-cache/cachers"
+	"github.com/GetStream/go-tool-cache/wire"
 	"github.com/go-jose/go-jose/v4"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/go-cmp/cmp"
 	"github.com/pierrec/lz4/v4"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 )
 
 // sha256OfEmpty is the SHA-256 hash of an empty string, used as a well-known
@@ -54,6 +57,15 @@ func mustGenerateTestKey() *ecdsa.PrivateKey {
 		panic(fmt.Sprintf("generating test ECDSA key: %v", err))
 	}
 	return k
+}
+
+func counterVecValue(t *testing.T, c *prometheus.CounterVec, labels ...string) float64 {
+	t.Helper()
+	var m dto.Metric
+	if err := c.WithLabelValues(labels...).Write(&m); err != nil {
+		t.Fatal(err)
+	}
+	return m.GetCounter().GetValue()
 }
 
 type tester struct {
@@ -757,6 +769,9 @@ func TestCleanOldObjectsByAge(t *testing.T) {
 	if clean1.Count != 1 || clean1.Size != stored1 {
 		t.Errorf("cleanOldObjects got %v, want {Count: 1, Size: %d}", clean1, stored1)
 	}
+	if got := counterVecValue(t, st.srv.evictionsTotal, "age"); got != 1 {
+		t.Errorf("gocached_evictions_total{reason=age} = %v, want 1", got)
+	}
 	clean2 := st.cleanOldObjects()
 	if clean2.Count != 0 || clean2.Size != 0 {
 		t.Errorf("cleanOldObjects got %v, want {Count: 0, Size: 0}", clean2)
@@ -799,6 +814,9 @@ func TestCleanOldObjectsBySize(t *testing.T) {
 
 	if got, want := st.cleanOldObjects(), (countAndSize{Count: 2, Size: 3}); got != want {
 		t.Errorf("cleanOldObjects got %v, want %v", got, want)
+	}
+	if got := counterVecValue(t, st.srv.evictionsTotal, "size"); got != 2 {
+		t.Errorf("gocached_evictions_total{reason=size} = %v, want 2", got)
 	}
 	if got, want := st.usageStats().All(), (countAndSize{Count: 2, Size: 7}); got != want {
 		t.Errorf("usageStats: %v; want %v", got, want)
@@ -2113,5 +2131,151 @@ func baseClaims(iss, sub string) jwt.MapClaims {
 		"aud": gocachedAudience,
 		"nbf": jwt.NewNumericDate(time.Now().Add(-time.Minute)),
 		"exp": jwt.NewNumericDate(time.Now().Add(time.Hour)),
+	}
+}
+
+func TestActionKindPrometheus(t *testing.T) {
+	st := newServerTester(t)
+	const (
+		actionID = "aa01aa01"
+		outputID = "bb02bb02"
+	)
+	val := "hello"
+
+	put, err := http.NewRequest("PUT", st.hs.URL+"/"+actionID+"/"+outputID, strings.NewReader(val))
+	if err != nil {
+		t.Fatal(err)
+	}
+	put.ContentLength = int64(len(val))
+	put.Header.Set(wire.ActionKindHeader, "compile")
+	res, err := http.DefaultClient.Do(put)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusNoContent {
+		t.Fatalf("PUT status = %d", res.StatusCode)
+	}
+	st.drain()
+
+	get, err := http.NewRequest("GET", st.hs.URL+"/action/"+actionID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	get.Header.Set("Want-Object", "1")
+	get.Header.Set(wire.ActionKindHeader, "compile")
+	gres, err := http.DefaultClient.Do(get)
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, gres.Body)
+	gres.Body.Close()
+	if gres.StatusCode != http.StatusOK {
+		t.Fatalf("GET status = %d", gres.StatusCode)
+	}
+
+	body := scrapeMetrics(t, st)
+	for _, want := range []string{
+		`action_kind="compile"`,
+		`gocached_put_duration_seconds_count{`,
+		`gocached_get_duration_seconds_count{`,
+		`gocached_blob_size_bytes_count{`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics missing %q\n%s", want, body)
+		}
+	}
+
+	miss, err := http.NewRequest("GET", st.hs.URL+"/action/cc03cc03", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	miss.Header.Set("Want-Object", "1")
+	mres, err := http.DefaultClient.Do(miss)
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, mres.Body)
+	mres.Body.Close()
+	body = scrapeMetrics(t, st)
+	if !strings.Contains(body, `action_kind=""`) {
+		t.Errorf("unset ActionKind should appear as empty label\n%s", body)
+	}
+}
+
+func TestHealthEndpoint(t *testing.T) {
+	st := newServerTester(t)
+
+	res, err := http.Get(st.hs.URL + "/health")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(res.Body)
+	res.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("GET /health status = %d, want 200", res.StatusCode)
+	}
+	if string(body) != "ok\n" {
+		t.Fatalf("GET /health body = %q, want ok\\n", body)
+	}
+
+	head, err := http.Head(st.hs.URL + "/health")
+	if err != nil {
+		t.Fatal(err)
+	}
+	head.Body.Close()
+	if head.StatusCode != http.StatusOK {
+		t.Fatalf("HEAD /health status = %d, want 200", head.StatusCode)
+	}
+
+	put, err := http.NewRequest("PUT", st.hs.URL+"/health", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pres, err := http.DefaultClient.Do(put)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pres.Body.Close()
+	if pres.StatusCode != http.StatusBadRequest {
+		t.Fatalf("PUT /health status = %d, want 400", pres.StatusCode)
+	}
+}
+
+func TestHealthEndpointUnauthenticatedWithJWT(t *testing.T) {
+	issuer, _ := startOIDCServer(t, testKey1.Public())
+	st := newServerTester(t, WithJWTAuth(issuer))
+
+	action, err := http.NewRequest("GET", st.hs.URL+"/action/aa01aa01", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	action.Header.Set("Want-Object", "1")
+	ares, err := http.DefaultClient.Do(action)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ares.Body.Close()
+	if ares.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("GET /action without token status = %d, want 401", ares.StatusCode)
+	}
+
+	res, err := http.Get(st.hs.URL + "/health")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(res.Body)
+	res.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("GET /health with JWT enabled status = %d, want 200", res.StatusCode)
+	}
+	if string(body) != "ok\n" {
+		t.Fatalf("GET /health body = %q, want ok\\n", body)
 	}
 }

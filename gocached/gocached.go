@@ -449,9 +449,10 @@ func (srv *Server) start() error {
 		Buckets: prometheus.DefBuckets,
 	})
 
-	// Buckets span roughly 1ms to 2s; cache hits should land in the low
-	// milliseconds, large PUTs and disk-backed GETs land higher up.
-	reqLatencyBuckets := []float64{0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2}
+	// Buckets span roughly 1ms to 30s; cache hits should land in the low
+	// milliseconds, large PUTs and disk-backed GETs in the seconds, and
+	// timed-out or slow-disk errors in the tail.
+	reqLatencyBuckets := []float64{0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30}
 	srv.getDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "gocached_get_duration_seconds",
 		Help:    "wall time of each cache get request, labeled by storage path: hot (hot tier disk), disk, inline, pending (put-queue), none (HEAD request), or error; type: get (hit), miss (404), or error; and action_kind when the client sent Go-Action-Kind",

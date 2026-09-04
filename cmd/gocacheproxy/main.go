@@ -18,7 +18,7 @@ var (
 	debugListen      = flag.String("debug-listen", "", "if non-empty, listen address for the debug HTTP server (pprof, metrics, etc)")
 	backendsFlag     = flag.String("backends", "", "comma-separated backend addresses (host:port)")
 	verbose          = flag.Bool("verbose", false, "verbose logging")
-	timeout          = flag.Duration("timeout", 3*time.Second, "per-attempt timeout for proxied PUT/GET to a backend")
+	timeout          = flag.Duration("timeout", 30*time.Second, "per-attempt timeout for proxied PUT/GET to a backend")
 	retries          = flag.Int("retries", 2, "number of PUT retries after the initial attempt (total attempts = 1 + retries)")
 	healthInterval   = flag.Duration("health-interval", 2*time.Second, "backend health probe interval")
 	maxInflightBytes = flag.Int64("max-inflight-bytes", 0, "soft cap on buffered PUT body bytes; PUTs above this are dropped silently. 0 = auto-detect 80% of container memory limit")

@@ -194,8 +194,7 @@ func TestProxyGetFailoverOnDown(t *testing.T) {
 	for _, b := range p.Backends {
 		b.healthy.Store(true)
 	}
-	// Force the dead backend first in HRW order by using a one-backend
-	// candidate list... we walk all healthy, so either order works.
+	// With R=2 and two healthy backends, GET tries both regardless of HRW order.
 	rec := httptest.NewRecorder()
 	p.ServeHTTP(rec, httptest.NewRequest("GET", "/action/"+id, nil))
 	if rec.Code != http.StatusOK {
@@ -255,6 +254,91 @@ func TestProxyGetNoHealthy(t *testing.T) {
 	}
 	if got := counterVal(t, p.getTotal.WithLabelValues("no_healthy_backend", "")); got != 1 {
 		t.Fatalf("no_healthy_backend = %v, want 1", got)
+	}
+}
+
+func TestProxyGetCapsFanOutToReplication(t *testing.T) {
+	const nBackends = 6
+	var hits atomic.Int32
+	svcs := make([]*httptest.Server, nBackends)
+	for i := range nBackends {
+		svcs[i] = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits.Add(1)
+			http.NotFound(w, r)
+		}))
+		defer svcs[i].Close()
+	}
+	p := newTestProxy(t, backendsFromServers(svcs))
+	p.Replication = 2
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/action/"+testActionID(), nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+	if got := hits.Load(); got != int32(p.Replication) {
+		t.Fatalf("backend GETs = %d, want %d (replication factor)", got, p.Replication)
+	}
+	if got := counterVal(t, p.getTotal.WithLabelValues("miss", "")); got != 1 {
+		t.Fatalf("get_total miss = %v, want 1", got)
+	}
+}
+
+func TestProxyGetHitsSecondReplica(t *testing.T) {
+	id := testActionID()
+	const n = 3
+	var hits [n]atomic.Int32
+	svcs := make([]*httptest.Server, n)
+	p := &Proxy{Client: &http.Client{Timeout: 2 * time.Second}, Retries: 2}
+	for i := range n {
+		i := i
+		svcs[i] = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits[i].Add(1)
+			cands, err := p.Candidates(id)
+			if err != nil {
+				t.Error(err)
+				http.NotFound(w, r)
+				return
+			}
+			switch svcs[i].URL {
+			case cands[0].URL:
+				http.NotFound(w, r)
+			case cands[1].URL:
+				w.Write([]byte(`{"outputID":"cafe0001","size":4}`))
+			default:
+				t.Errorf("GET probed backend %s beyond replication", svcs[i].URL)
+				http.NotFound(w, r)
+			}
+		}))
+		defer svcs[i].Close()
+	}
+	p.Backends = backendsFromServers(svcs)
+	p.ensure()
+	for _, b := range p.Backends {
+		b.healthy.Store(true)
+	}
+
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/action/"+id, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+	cands, err := p.Candidates(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var first, second, extra int32
+	for i, s := range svcs {
+		switch s.URL {
+		case cands[0].URL:
+			first = hits[i].Load()
+		case cands[1].URL:
+			second = hits[i].Load()
+		default:
+			extra += hits[i].Load()
+		}
+	}
+	if first != 1 || second != 1 || extra != 0 {
+		t.Fatalf("first=%d second=%d extra=%d, want 1, 1, 0", first, second, extra)
 	}
 }
 

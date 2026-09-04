@@ -27,7 +27,7 @@ const (
 	defaultHealthEvery   = 2 * time.Second
 	healthProbeTimeout   = 5 * time.Second
 	unhealthyAfterFails  = 2
-	defaultClientTimeout = 3 * time.Second
+	defaultClientTimeout = 30 * time.Second
 )
 
 // Backend is a single gocached server.
@@ -135,8 +135,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// proxyGet walks HRW-ordered healthy backends. Transport errors and 5xx
-// fail over; a backend 404 is a replica miss. The client never sees 5xx.
+// proxyGet walks the first R healthy HRW candidates — the same set
+// proxyPut writes to. Transport errors and 5xx fail over within that
+// set; a backend 404 is a replica miss. The client never sees 5xx.
 func (p *Proxy) proxyGet(w http.ResponseWriter, r *http.Request, actionID string) {
 	kind := p.actionKind(r)
 	cands, err := p.Candidates(actionID)
@@ -154,9 +155,12 @@ func (p *Proxy) proxyGet(w http.ResponseWriter, r *http.Request, actionID string
 		return
 	}
 
+	n := min(p.replication(), len(healthy))
+	targets := healthy[:n]
+
 	sawMiss := false
 	sawErr := false
-	for _, b := range healthy {
+	for _, b := range targets {
 		start := time.Now()
 		resp, err := p.forward(r, b, r.URL.RequestURI(), nil, 0)
 		p.duration.WithLabelValues(r.Method, b.URL, kind).Observe(time.Since(start).Seconds())

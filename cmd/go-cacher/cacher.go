@@ -7,16 +7,19 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/GetStream/go-tool-cache/cacheproc"
@@ -33,6 +36,13 @@ var (
 	verbose    = flag.Bool("verbose", false, "be verbose")
 	gwPort     = flag.Int("gateway-addr-port", 0, "if non-zero, try to use an HTTP server on this port on our machine's gateway IP. If that fails, use local disk instead.")
 	token      = flag.String("access-token", "", "optional access token to use with the cache server")
+	sweepMode  = flag.Bool("sweep", false, "run the standalone cache sweeper instead of GOCACHEPROG")
+	maxSizeGB  = flag.Int("max-size-gb", 100, "maximum cached object size in GiB; 0 means no limit")
+	fsHighPct  = flag.Float64("filesystem-high-percent", 90, "filesystem usage percentage that starts eviction")
+	fsLowPct   = flag.Float64("filesystem-low-percent", 80, "filesystem target percentage after eviction starts")
+	interval   = flag.Duration("interval", 10*time.Minute, "base interval between sweep attempts")
+	jitter     = flag.Duration("jitter", 5*time.Minute, "maximum random delay added to each interval")
+	firstDelay = flag.Duration("initial-delay", 5*time.Minute, "maximum randomized delay before the first sweep")
 )
 
 func main() {
@@ -52,8 +62,26 @@ func main() {
 	if err := os.MkdirAll(*dir, 0755); err != nil {
 		log.Fatal(err)
 	}
+	if *sweepMode {
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		sweeper := cachers.NewSweeper(cachers.SweepConfig{
+			Dir:               *dir,
+			MaxBytes:          int64(*maxSizeGB) << 30,
+			FilesystemHighPct: *fsHighPct,
+			FilesystemLowPct:  *fsLowPct,
+			BaseInterval:      *interval,
+			Jitter:            *jitter,
+			InitialDelay:      *firstDelay,
+			Logf:              log.Printf,
+		})
+		if err := sweeper.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Fatal(err)
+		}
+		return
+	}
 
-	dc := &cachers.DiskCache{Dir: *dir}
+	dc := &cachers.DiskCache{Dir: *dir, HoldOpen: true}
 
 	var p *cacheproc.Process
 	p = &cacheproc.Process{
@@ -70,7 +98,7 @@ func main() {
 			log.Printf("cacher: closing; %d gets (%d hits, %d misses, %d errors); %d puts (%s)",
 				p.Gets.Load(), p.GetHits.Load(), p.GetMisses.Load(), p.GetErrors.Load(), p.Puts.Load(), putDetail)
 		}
-		return nil
+		return dc.Close()
 	}
 	p.Close = statsFunc
 

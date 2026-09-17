@@ -43,3 +43,34 @@ $ GOCACHEPROG="$HOME/go/bin/go-cacher --verbose" go install std
 Defaulting to cache dir /home/bradfitz/.cache/go-cacher ...
 cacher: closing; 808 gets (808 hits, 0 misses, 0 errors); 0 puts (0 errors)
 ```
+
+## Shared local cache and sweeping
+
+Multiple `go-cacher` helpers can safely use the same `--cache-dir`. On Unix,
+each returned object path is protected by a shared advisory lock until that
+helper receives the GOCACHEPROG `close` command or exits. Publishers and the
+sweeper use the same stable sidecar lock files, so atomic object replacement
+does not split coordination across object inodes. Output sidecar lock files are intentionally retained and are not counted as
+cached object bytes. The `DiskCache` library defaults to transient validation;
+the `go-cacher` GOCACHEPROG mode explicitly enables hold-open behavior.
+
+Run one standalone sweeper per host (additional processes or pods sharing the
+tree safely skip while another sweep is active):
+
+```sh
+go-cacher --sweep \
+  --cache-dir=/var/cache/go-cacher \
+  --max-size-gb=100 \
+  --filesystem-high-percent=90 \
+  --filesystem-low-percent=80 \
+  --interval=10m \
+  --jitter=5m \
+  --initial-delay=5m
+```
+
+Sweep mode does not speak GOCACHEPROG. It waits for a randomized initial delay,
+then periodically removes least-recently-used objects until both the object-byte
+limit and filesystem low watermark are satisfied. Active objects are skipped,
+and their action indexes are removed before object deletion. `SIGINT` and
+`SIGTERM` stop the sweeper cleanly. Set `--max-size-gb=0` to disable the byte
+limit, or set both filesystem percentages to zero to disable watermarks.

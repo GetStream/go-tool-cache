@@ -66,9 +66,26 @@ func (p *Proxy) initMetrics() {
 		Name: "gocacheproxy_backend_bytes_out",
 		Help: "response body bytes received from backends",
 	})
+	p.cacherHeldLocks = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "go_cacher_held_locks",
+		Help: "Object file locks currently retained by a GOCACHEPROG helper",
+	}, []string{"pod"})
+	p.cacherLockWaiters = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "go_cacher_lock_waiters",
+		Help: "GOCACHEPROG requests currently waiting to acquire an object lock",
+	}, []string{"pod"})
+	p.cacherLastProgress = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "go_cacher_last_progress_timestamp_seconds",
+		Help: "Unix timestamp of the last completed GOCACHEPROG get or put",
+	}, []string{"pod"})
+	p.cacherRunnerCPU = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "go_cacher_runner_cpu_seconds_total",
+		Help: "Cumulative CPU seconds consumed by the runner cgroup reported by GOCACHEPROG",
+	}, []string{"pod"})
 	reg.MustRegister(
 		p.getTotal, p.duration, p.backendUp, p.inflight, p.putDropped,
 		p.putOK, p.putErr, p.bytesIn, p.bytesOut, p.backendBytesIn, p.backendBytesOut,
+		p.cacherHeldLocks, p.cacherLockWaiters, p.cacherLastProgress, p.cacherRunnerCPU,
 	)
 	p.metricsHandler = promhttp.HandlerFor(reg, promhttp.HandlerOpts{ErrorLog: log.Default()})
 	for _, b := range p.Backends {
@@ -90,6 +107,7 @@ func (p *Proxy) ServeHTTPDebug(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, "<p>See <a href='/metrics'>/metrics</a> for Prometheus metrics.</p>")
 		io.WriteString(w, "<p>See <a href='/debug/pprof/'>/debug/pprof/</a> for pprof</p>")
 	case r.URL.Path == "/metrics":
+		p.pruneClientStatuses(time.Now())
 		p.metricsHandler.ServeHTTP(w, r)
 	case strings.HasPrefix(r.URL.Path, "/debug/pprof/profile"):
 		pprof.Profile(w, r)

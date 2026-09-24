@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -28,6 +29,8 @@ type heldObject struct {
 
 const diskLockStripes = 256
 
+const lockRetryInterval = 100 * time.Millisecond
+
 type DiskCache struct {
 	Dir     string
 	Verbose bool
@@ -38,11 +41,17 @@ type DiskCache struct {
 	// remain protected for the lifetime of the helper process.
 	HoldOpen bool
 
+	// LockTimeout bounds how long Get or Put waits to acquire an object lock.
+	// A zero value preserves the historical unbounded wait.
+	LockTimeout time.Duration
+
 	gates [diskLockStripes]sync.Mutex
 
 	mu     sync.Mutex
 	held   map[string]heldObject
 	closed bool
+
+	lockWaiters atomic.Int64
 }
 
 func (dc *DiskCache) logf(format string, args ...any) {
@@ -91,6 +100,59 @@ func (dc *DiskCache) retain(path string, h heldObject) error {
 	}
 	dc.held[path] = h
 	return nil
+}
+
+// HeldCount reports the number of object locks retained for cmd/go.
+func (dc *DiskCache) HeldCount() int {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	return len(dc.held)
+}
+
+// LockWaiters reports the number of requests waiting for an object lock.
+func (dc *DiskCache) LockWaiters() int64 {
+	return dc.lockWaiters.Load()
+}
+
+func (dc *DiskCache) acquireLock(ctx context.Context, path string, exclusive bool) (*fileLock, error) {
+	if dc.LockTimeout <= 0 {
+		lock, _, err := acquireFileLock(path, exclusive, false)
+		return lock, err
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, dc.LockTimeout)
+	defer cancel()
+
+	waiting := false
+	defer func() {
+		if waiting {
+			dc.lockWaiters.Add(-1)
+		}
+	}()
+
+	for {
+		lock, acquired, err := acquireFileLock(path, exclusive, true)
+		if err != nil {
+			return nil, err
+		}
+		if acquired {
+			return lock, nil
+		}
+		if !waiting {
+			waiting = true
+			dc.lockWaiters.Add(1)
+		}
+
+		timer := time.NewTimer(lockRetryInterval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return nil, fmt.Errorf("acquiring cache object lock %s: %w", path, ctx.Err())
+		case <-timer.C:
+		}
+	}
 }
 
 // Close releases all object locks and descriptors retained for paths returned
@@ -162,12 +224,9 @@ func (dc *DiskCache) Get(ctx context.Context, actionID string) (outputID, diskPa
 	if err := os.MkdirAll(filepath.Dir(outputFile), 0o755); err != nil {
 		return "", "", err
 	}
-	lock, acquired, err := acquireFileLock(outputFile+".lock", false, false)
+	lock, err := dc.acquireLock(ctx, outputFile+".lock", false)
 	if err != nil {
 		return "", "", err
-	}
-	if !acquired {
-		return "", "", nil
 	}
 	f, valid, err := openValidObject(outputFile, ie.Size)
 	if err != nil {
@@ -300,7 +359,7 @@ func (dc *DiskCache) Put(ctx context.Context, actionID, outputID string, size in
 
 	// Immutable objects normally already exist. Join current readers with a
 	// shared lock so this fast path never waits for GOCACHEPROG helpers to exit.
-	lock, _, err := acquireFileLock(outputFile+".lock", false, false)
+	lock, err := dc.acquireLock(ctx, outputFile+".lock", false)
 	if err != nil {
 		return "", err
 	}
@@ -323,7 +382,7 @@ func (dc *DiskCache) Put(ctx context.Context, actionID, outputID string, size in
 
 	// Release SH before taking EX, then recheck because another process may
 	// have published the object while this process was switching lock modes.
-	lock, _, err = acquireFileLock(outputFile+".lock", true, false)
+	lock, err = dc.acquireLock(ctx, outputFile+".lock", true)
 	if err != nil {
 		return "", err
 	}

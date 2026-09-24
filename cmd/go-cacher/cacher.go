@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -19,6 +20,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -31,22 +33,36 @@ import (
 const shutdownDrainTimeout = 5 * time.Second
 
 var (
-	dir        = flag.String("cache-dir", "", "cache directory; empty means automatic")
-	serverBase = flag.String("cache-server", "", "optional cache server HTTP prefix(es), comma-separated (scheme and authority only); should be low latency. empty means to not use one.")
-	verbose    = flag.Bool("verbose", false, "be verbose")
-	gwPort     = flag.Int("gateway-addr-port", 0, "if non-zero, try to use an HTTP server on this port on our machine's gateway IP. If that fails, use local disk instead.")
-	token      = flag.String("access-token", "", "optional access token to use with the cache server")
-	sweepMode  = flag.Bool("sweep", false, "run the standalone cache sweeper instead of GOCACHEPROG")
-	maxSizeGB  = flag.Int("max-size-gb", 100, "maximum cached object size in GiB; 0 means no limit")
-	fsHighPct  = flag.Float64("filesystem-high-percent", 90, "filesystem usage percentage that starts eviction")
-	fsLowPct   = flag.Float64("filesystem-low-percent", 80, "filesystem target percentage after eviction starts")
-	interval   = flag.Duration("interval", 10*time.Minute, "base interval between sweep attempts")
-	jitter     = flag.Duration("jitter", 5*time.Minute, "maximum random delay added to each interval")
-	firstDelay = flag.Duration("initial-delay", 5*time.Minute, "maximum randomized delay before the first sweep")
+	dir         = flag.String("cache-dir", "", "cache directory; empty means automatic")
+	serverBase  = flag.String("cache-server", "", "optional cache server HTTP prefix(es), comma-separated (scheme and authority only); should be low latency. empty means to not use one.")
+	verbose     = flag.Bool("verbose", false, "be verbose")
+	gwPort      = flag.Int("gateway-addr-port", 0, "if non-zero, try to use an HTTP server on this port on our machine's gateway IP. If that fails, use local disk instead.")
+	token       = flag.String("access-token", "", "optional access token to use with the cache server")
+	httpTimeout = flag.Duration("http-timeout", 2*time.Minute, "timeout for each request to the remote cache")
+	lockTimeout = flag.Duration("lock-timeout", 10*time.Minute, "maximum time to wait for a cache object lock; 0 means no timeout")
+	statusURL   = flag.String("status-url", "", "optional gocacheproxy client-status endpoint")
+	clientID    = flag.String("client-id", "", "stable client identifier included in status heartbeats")
+	statusEvery = flag.Duration("status-interval", 15*time.Second, "interval between client-status heartbeats")
+	sweepMode   = flag.Bool("sweep", false, "run the standalone cache sweeper instead of GOCACHEPROG")
+	maxSizeGB   = flag.Int("max-size-gb", 100, "maximum cached object size in GiB; 0 means no limit")
+	fsHighPct   = flag.Float64("filesystem-high-percent", 90, "filesystem usage percentage that starts eviction")
+	fsLowPct    = flag.Float64("filesystem-low-percent", 80, "filesystem target percentage after eviction starts")
+	interval    = flag.Duration("interval", 10*time.Minute, "base interval between sweep attempts")
+	jitter      = flag.Duration("jitter", 5*time.Minute, "maximum random delay added to each interval")
+	firstDelay  = flag.Duration("initial-delay", 5*time.Minute, "maximum randomized delay before the first sweep")
 )
 
 func main() {
 	flag.Parse()
+	if *httpTimeout <= 0 {
+		log.Fatal("-http-timeout must be positive")
+	}
+	if (*statusURL == "") != (*clientID == "") {
+		log.Fatal("-status-url and -client-id must be set together")
+	}
+	if *statusEvery <= 0 {
+		log.Fatal("-status-interval must be positive")
+	}
 	if *verbose {
 		log.Printf("go-cacher: verbose mode enabled")
 	}
@@ -81,13 +97,15 @@ func main() {
 		return
 	}
 
-	dc := &cachers.DiskCache{Dir: *dir, HoldOpen: true}
+	dc := &cachers.DiskCache{Dir: *dir, HoldOpen: true, LockTimeout: *lockTimeout}
+	defer dc.Close()
 
 	var p *cacheproc.Process
 	p = &cacheproc.Process{
 		Get: dc.Get,
 		Put: dc.Put,
 	}
+	p.LastProgressUnixNano.Store(time.Now().UnixNano())
 	var hc *cachers.HTTPClient
 	statsFunc := func() error {
 		if *verbose {
@@ -121,6 +139,7 @@ func main() {
 	}
 
 	if *serverBase != "" {
+		remoteClient := &http.Client{Timeout: *httpTimeout}
 		urls := strings.Split(*serverBase, ",")
 		for i, u := range urls {
 			u = strings.TrimSpace(u)
@@ -133,6 +152,7 @@ func main() {
 			hc = &cachers.HTTPClient{
 				BaseURL:     urls[0],
 				Disk:        dc,
+				HTTPClient:  remoteClient,
 				Verbose:     *verbose,
 				AccessToken: *token,
 			}
@@ -145,6 +165,7 @@ func main() {
 				clients[i] = &cachers.HTTPClient{
 					BaseURL:        u,
 					Disk:           dc,
+					HTTPClient:     remoteClient,
 					Verbose:        *verbose,
 					AccessToken:    *token,
 					BestEffortHTTP: true,
@@ -169,6 +190,27 @@ func main() {
 			}
 		}
 	}
+
+	statusCtx, stopStatus := context.WithCancel(context.Background())
+	var statusWG sync.WaitGroup
+	if *statusURL != "" && *clientID != "" {
+		reporter := statusReporter{
+			URL:      *statusURL,
+			ClientID: *clientID,
+			Interval: *statusEvery,
+			Disk:     dc,
+			Process:  p,
+			Client:   &http.Client{Timeout: 5 * time.Second},
+			Verbose:  *verbose,
+		}
+		statusWG.Go(func() {
+			reporter.Run(statusCtx)
+		})
+	}
+	defer func() {
+		stopStatus()
+		statusWG.Wait()
+	}()
 
 	if err := p.Run(); err != nil {
 		log.Fatal(err)

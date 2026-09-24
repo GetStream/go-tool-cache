@@ -1,6 +1,8 @@
 package gocacheproxy
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -52,6 +54,58 @@ func counterVal(t *testing.T, c interface{ Write(*dto.Metric) error }) float64 {
 		return m.GetCounter().GetValue()
 	}
 	return m.GetGauge().GetValue()
+}
+
+func TestClientStatusMetricsAndExpiry(t *testing.T) {
+	p := newTestProxy(t, nil)
+	p.ClientStatusTTL = time.Minute
+	status := ClientStatus{
+		ClientID:                   "runner-abc123",
+		HeldLocks:                  640,
+		LockWaiters:                1,
+		LastProgressUnixSeconds:    1_700_000_000,
+		RunnerCPUUsageSecondsTotal: 12.5,
+	}
+	body, err := json.Marshal(status)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, ClientStatusPath, bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if got := counterVal(t, p.cacherHeldLocks.WithLabelValues(status.ClientID)); got != 640 {
+		t.Fatalf("held locks = %v, want 640", got)
+	}
+	if got := counterVal(t, p.cacherRunnerCPU.WithLabelValues(status.ClientID)); got != 12.5 {
+		t.Fatalf("runner CPU = %v, want 12.5", got)
+	}
+
+	p.clientStatusMu.Lock()
+	entry := p.clientStatuses[status.ClientID]
+	entry.lastSeen = time.Now().Add(-2 * time.Minute)
+	p.clientStatuses[status.ClientID] = entry
+	p.clientStatusMu.Unlock()
+	p.pruneClientStatuses(time.Now())
+
+	debugReq := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	debugRec := httptest.NewRecorder()
+	p.ServeHTTPDebug(debugRec, debugReq)
+	if strings.Contains(debugRec.Body.String(), status.ClientID) {
+		t.Fatalf("expired client metric remains:\n%s", debugRec.Body.String())
+	}
+}
+
+func TestClientStatusRejectsInvalidPayload(t *testing.T) {
+	p := newTestProxy(t, nil)
+	req := httptest.NewRequest(http.MethodPost, ClientStatusPath, strings.NewReader(`{"client_id":"../../bad","held_locks":1}`))
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
 }
 
 func TestHRWDeterministicAndOrdered(t *testing.T) {

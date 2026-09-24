@@ -6,11 +6,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -251,6 +253,9 @@ func TestDiskCacheSharedLockPreventsSweepUntilClose(t *testing.T) {
 	if _, _, err := reader.Get(context.Background(), testActionA); err != nil {
 		t.Fatal(err)
 	}
+	if got := reader.HeldCount(); got != 1 {
+		t.Fatalf("HeldCount = %d, want 1", got)
+	}
 
 	sweeper := testSweeper(dir, 1)
 	result, err := sweeper.SweepOnce(context.Background())
@@ -266,6 +271,9 @@ func TestDiskCacheSharedLockPreventsSweepUntilClose(t *testing.T) {
 	if err := reader.Close(); err != nil {
 		t.Fatal(err)
 	}
+	if got := reader.HeldCount(); got != 0 {
+		t.Fatalf("HeldCount after Close = %d, want 0", got)
+	}
 
 	result, err = sweeper.SweepOnce(context.Background())
 	if err != nil {
@@ -279,6 +287,54 @@ func TestDiskCacheSharedLockPreventsSweepUntilClose(t *testing.T) {
 	}
 	if _, err := os.Stat((&DiskCache{Dir: dir}).ActionFilename(testActionA)); !os.IsNotExist(err) {
 		t.Fatalf("action index still exists after object deletion: %v", err)
+	}
+}
+
+func TestDiskCacheLockTimeout(t *testing.T) {
+	dir := t.TempDir()
+	path := putAndClose(t, dir, testActionA, testOutputA, []byte("object"))
+
+	blocker, _, err := acquireFileLock(path+".lock", true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.close()
+
+	dc := &DiskCache{
+		Dir:         dir,
+		HoldOpen:    true,
+		LockTimeout: 100 * time.Millisecond,
+	}
+	defer dc.Close()
+
+	waiting := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		close(waiting)
+		_, _, err := dc.Get(context.Background(), testActionA)
+		done <- err
+	}()
+	<-waiting
+
+	deadline := time.After(time.Second)
+	for dc.LockWaiters() != 1 {
+		select {
+		case <-deadline:
+			t.Fatal("lock waiter was not reported")
+		default:
+			runtime.Gosched()
+		}
+	}
+
+	err = <-done
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Get error = %v, want context deadline exceeded", err)
+	}
+	if got := dc.LockWaiters(); got != 0 {
+		t.Fatalf("LockWaiters after timeout = %d, want 0", got)
+	}
+	if got := dc.HeldCount(); got != 0 {
+		t.Fatalf("HeldCount after timeout = %d, want 0", got)
 	}
 }
 

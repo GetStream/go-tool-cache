@@ -5,6 +5,7 @@ package gocacheproxy
 import (
 	"bytes"
 	"cmp"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -23,12 +24,29 @@ import (
 
 const (
 	healthPath           = "/health"
+	ClientStatusPath     = "/client-status"
 	defaultReplication   = 2
 	defaultHealthEvery   = 2 * time.Second
 	healthProbeTimeout   = 5 * time.Second
 	unhealthyAfterFails  = 2
 	defaultClientTimeout = 30 * time.Second
+	defaultClientTTL     = time.Minute
+	maxClientStatusBody  = 4 << 10
 )
+
+// ClientStatus is a point-in-time heartbeat from one GOCACHEPROG helper.
+type ClientStatus struct {
+	ClientID                   string  `json:"client_id"`
+	HeldLocks                  int     `json:"held_locks"`
+	LockWaiters                int64   `json:"lock_waiters"`
+	LastProgressUnixSeconds    float64 `json:"last_progress_unix_seconds"`
+	RunnerCPUUsageSecondsTotal float64 `json:"runner_cpu_usage_seconds_total"`
+}
+
+type clientStatusEntry struct {
+	status   ClientStatus
+	lastSeen time.Time
+}
 
 // Backend is a single gocached server.
 type Backend struct {
@@ -58,7 +76,10 @@ type Proxy struct {
 	MaxInflightBytes int64
 	// HealthInterval is the backend probe period. Zero means 2s.
 	HealthInterval time.Duration
-	Verbose        bool
+	// ClientStatusTTL controls how long helper heartbeat metrics remain after
+	// the last update. Zero means one minute.
+	ClientStatusTTL time.Duration
+	Verbose         bool
 
 	inflightBytes atomic.Int64
 
@@ -75,6 +96,13 @@ type Proxy struct {
 	bytesOut        *prometheus.CounterVec
 	backendBytesIn  prometheus.Counter
 	backendBytesOut prometheus.Counter
+
+	clientStatusMu     sync.Mutex
+	clientStatuses     map[string]clientStatusEntry
+	cacherHeldLocks    *prometheus.GaugeVec
+	cacherLockWaiters  *prometheus.GaugeVec
+	cacherLastProgress *prometheus.GaugeVec
+	cacherRunnerCPU    *prometheus.GaugeVec
 }
 
 func (p *Proxy) ensure() {
@@ -120,6 +148,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.URL.Path == healthPath:
 		p.handleHealth(w, r)
+	case r.URL.Path == ClientStatusPath && r.Method == http.MethodPost:
+		p.handleClientStatus(w, r)
 	case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/action/"):
 		actionID := strings.TrimPrefix(r.URL.Path, "/action/")
 		p.proxyGet(w, r, actionID)
@@ -132,6 +162,73 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.proxyPut(w, r, parts[0])
 	default:
 		http.Error(w, "not found", http.StatusNotFound)
+	}
+}
+
+func validClientID(id string) bool {
+	if id == "" || len(id) > 128 {
+		return false
+	}
+	for _, r := range id {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' || r == '.' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func (p *Proxy) handleClientStatus(w http.ResponseWriter, r *http.Request) {
+	body := http.MaxBytesReader(w, r.Body, maxClientStatusBody)
+	defer body.Close()
+
+	var status ClientStatus
+	dec := json.NewDecoder(body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&status); err != nil {
+		http.Error(w, "invalid client status", http.StatusBadRequest)
+		return
+	}
+	if !validClientID(status.ClientID) ||
+		status.HeldLocks < 0 ||
+		status.LockWaiters < 0 ||
+		status.LastProgressUnixSeconds < 0 ||
+		status.RunnerCPUUsageSecondsTotal < 0 {
+		http.Error(w, "invalid client status", http.StatusBadRequest)
+		return
+	}
+
+	p.clientStatusMu.Lock()
+	if p.clientStatuses == nil {
+		p.clientStatuses = make(map[string]clientStatusEntry)
+	}
+	p.clientStatuses[status.ClientID] = clientStatusEntry{status: status, lastSeen: time.Now()}
+	p.clientStatusMu.Unlock()
+
+	p.cacherHeldLocks.WithLabelValues(status.ClientID).Set(float64(status.HeldLocks))
+	p.cacherLockWaiters.WithLabelValues(status.ClientID).Set(float64(status.LockWaiters))
+	p.cacherLastProgress.WithLabelValues(status.ClientID).Set(status.LastProgressUnixSeconds)
+	p.cacherRunnerCPU.WithLabelValues(status.ClientID).Set(status.RunnerCPUUsageSecondsTotal)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (p *Proxy) pruneClientStatuses(now time.Time) {
+	ttl := p.ClientStatusTTL
+	if ttl <= 0 {
+		ttl = defaultClientTTL
+	}
+
+	p.clientStatusMu.Lock()
+	defer p.clientStatusMu.Unlock()
+	for id, entry := range p.clientStatuses {
+		if now.Sub(entry.lastSeen) <= ttl {
+			continue
+		}
+		delete(p.clientStatuses, id)
+		p.cacherHeldLocks.DeleteLabelValues(id)
+		p.cacherLockWaiters.DeleteLabelValues(id)
+		p.cacherLastProgress.DeleteLabelValues(id)
+		p.cacherRunnerCPU.DeleteLabelValues(id)
 	}
 }
 

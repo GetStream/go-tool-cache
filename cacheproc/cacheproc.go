@@ -19,6 +19,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/GetStream/go-tool-cache/wire"
 )
@@ -57,6 +58,9 @@ type Process struct {
 	GetErrors atomic.Int64
 	Puts      atomic.Int64
 	PutErrors atomic.Int64
+
+	InFlight             atomic.Int64
+	LastProgressUnixNano atomic.Int64
 }
 
 func (p *Process) Run() error {
@@ -142,7 +146,10 @@ func (p *Process) handleRequest(ctx context.Context, req *wire.Request, res *wir
 
 func (p *Process) handleGet(ctx context.Context, req *wire.Request, res *wire.Response) (retErr error) {
 	p.Gets.Add(1)
+	p.InFlight.Add(1)
 	defer func() {
+		p.InFlight.Add(-1)
+		p.LastProgressUnixNano.Store(time.Now().UnixNano())
 		if retErr != nil {
 			p.GetErrors.Add(1)
 		} else if res.Miss {
@@ -190,7 +197,10 @@ func (p *Process) handleGet(ctx context.Context, req *wire.Request, res *wire.Re
 func (p *Process) handlePut(ctx context.Context, req *wire.Request, res *wire.Response) (retErr error) {
 	actionID, outputID := fmt.Sprintf("%x", req.ActionID), fmt.Sprintf("%x", req.OutputID)
 	p.Puts.Add(1)
+	p.InFlight.Add(1)
 	defer func() {
+		p.InFlight.Add(-1)
+		p.LastProgressUnixNano.Store(time.Now().UnixNano())
 		if retErr != nil {
 			p.PutErrors.Add(1)
 			log.Printf("put(action %s, obj %s, %v bytes): %v", actionID, outputID, req.BodySize, retErr)

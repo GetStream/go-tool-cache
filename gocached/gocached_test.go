@@ -823,6 +823,35 @@ func TestCleanOldObjectsBySize(t *testing.T) {
 	}
 }
 
+// TestCleanOldObjectsBySizeWithMaxAge checks that size-based eviction still
+// works when a maxAge is also configured and nothing is past it yet.
+func TestCleanOldObjectsBySizeWithMaxAge(t *testing.T) {
+	st := newServerTester(t)
+	st.srv.maxAge = 24 * time.Hour
+
+	c1 := st.mkClient()
+	st.wantPut(c1, "0001", "9901", "1")
+	st.advanceClock(time.Second)
+	st.wantPut(c1, "0002", "9902", "22")
+	st.advanceClock(time.Second)
+	st.wantPut(c1, "0003", "9903", "333")
+	st.advanceClock(time.Second)
+	st.wantPut(c1, "0004", "9904", "4444")
+	st.advanceClock(time.Second)
+
+	st.srv.maxSize = 8 // the only way get to 8 or under is by deleting "1" and "22" (3 bytes)
+
+	if got, want := st.cleanOldObjects(), (countAndSize{Count: 2, Size: 3}); got != want {
+		t.Errorf("cleanOldObjects got %v, want %v", got, want)
+	}
+	if got := counterVecValue(t, st.srv.evictionsTotal, "size"); got != 2 {
+		t.Errorf("gocached_evictions_total{reason=size} = %v, want 2", got)
+	}
+	if got, want := st.usageStats().All(), (countAndSize{Count: 2, Size: 7}); got != want {
+		t.Errorf("usageStats: %v; want %v", got, want)
+	}
+}
+
 func TestLZ4Storage(t *testing.T) {
 	st := newServerTester(t)
 	c := st.mkClient()

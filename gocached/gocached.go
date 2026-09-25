@@ -2992,6 +2992,12 @@ func (srv *Server) cleanupTick(ctx context.Context) (countAndSize, error) {
 	if !overAge && !overSize {
 		return ret, nil
 	}
+	if !overAge {
+		// Size-only cleanup must consider Actions of any age. Keeping the
+		// maxAge cutoff here would only match Actions that are already past
+		// maxAge, which don't exist when overAge is false.
+		cutoff = math.MaxInt64
+	}
 	// maxAge cleanup runs to count limit (every stale Action must go);
 	// size-only cleanup runs until we've reclaimed enough bytes.
 	maxBytes := int64(math.MaxInt64)

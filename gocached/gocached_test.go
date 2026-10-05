@@ -429,6 +429,9 @@ func startOIDCServer(t *testing.T, publicKey crypto.PublicKey, opts ...oidcOpt) 
 
 func TestServer(t *testing.T) {
 	st := newServerTester(t)
+	// Access-time rewrites wait half of this. Set after start so usage-stat
+	// cohorts stay on the default day buckets.
+	st.srv.maxAge = 12 * time.Hour
 
 	ctx := context.Background()
 
@@ -474,8 +477,15 @@ func TestServer(t *testing.T) {
 
 	// Check that access time gets updated.
 	// Do it from a fresh client without a disk cache.
+	// Age objects past both the relatime bump threshold and the 48h usage
+	// cohort. The histogram assertion below expects unbumped actions to fall
+	// out of the 24h and 48h buckets.
 	st.wantMetric(&st.srv.m.GetAccessBumps, 0)
-	st.advanceClock(relAtimeSeconds * 2 * time.Second) // advance clock by 2 days
+	advance := 48 * time.Hour
+	if rel := time.Duration(st.srv.relAtimeSeconds()) * time.Second * 2; rel > advance {
+		advance = rel
+	}
+	st.advanceClock(advance)
 	c3 := st.mkClient()
 	st.wantGet(c3, testActionID, testOutputID, testObjectValue)
 	st.wantMetric(&st.srv.m.GetAccessBumps, 1)
@@ -502,7 +512,40 @@ func TestServer(t *testing.T) {
 		t.Errorf("usageStats mismatch (-got +want):\n%s", diff)
 	}
 
-	st.advanceClock(relAtimeSeconds * 2 * time.Second) // advance clock by 2 days
+	st.advanceClock(advance) // past relatime again; nothing asserts after this
+}
+
+func TestRelAtimeSecondsTracksMaxAge(t *testing.T) {
+	srv := &Server{}
+	if got := srv.relAtimeSeconds(); got != 0 {
+		t.Fatalf("maxAge 0: relAtimeSeconds = %d, want 0", got)
+	}
+	srv.maxAge = 12 * time.Hour
+	if got, want := srv.relAtimeSeconds(), int64((6*time.Hour)/time.Second); got != want {
+		t.Fatalf("maxAge 12h: relAtimeSeconds = %d, want %d", got, want)
+	}
+	srv.maxAge = 2 * time.Hour
+	if got, want := srv.relAtimeSeconds(), int64(time.Hour/time.Second); got != want {
+		t.Fatalf("maxAge 2h: relAtimeSeconds = %d, want %d", got, want)
+	}
+}
+
+func TestAccessBumpFollowsHalfMaxAge(t *testing.T) {
+	st := newServerTester(t)
+	st.srv.maxAge = 2 * time.Hour
+
+	c := st.mkClient()
+	st.wantPut(c, "0001", "9901", "data")
+
+	// Inside the halfway window: a hit must not rewrite atime.
+	st.advanceClock(59 * time.Minute)
+	st.wantGet(st.mkClient(), "0001", "9901", "data")
+	st.wantMetric(&st.srv.m.GetAccessBumps, 0)
+
+	// Past half of the 2h max age: the next hit rewrites atime.
+	st.advanceClock(2 * time.Minute)
+	st.wantGet(st.mkClient(), "0001", "9901", "data")
+	st.wantMetric(&st.srv.m.GetAccessBumps, 1)
 }
 
 // TestEvictionQueryPlan is the lockdown test for the eviction query: it

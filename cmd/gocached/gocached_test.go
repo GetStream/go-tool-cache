@@ -4,10 +4,24 @@
 package main
 
 import (
+	"flag"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 )
+
+func TestMaxAgeHoursFlag(t *testing.T) {
+	f := flag.Lookup("max-age-hours")
+	if f == nil {
+		t.Fatal("missing -max-age-hours flag")
+	}
+	if f.DefValue != "12" {
+		t.Errorf("max-age-hours default = %s, want 12", f.DefValue)
+	}
+	if flag.Lookup("max-age-days") != nil {
+		t.Error("max-age-days flag is still registered")
+	}
+}
 
 func TestJWTClaimFlag(t *testing.T) {
 	for name, tc := range map[string]struct {

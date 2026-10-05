@@ -31,7 +31,7 @@ var (
 	debugListen = flag.String("debug-listen", "", "if non-empty, listen address for the debug HTTP server (pprof, metrics, etc)")
 
 	maxSize = flag.Int("max-size-gb", 50, "maximum size of the cache in GiB; 0 means no limit")
-	maxAge  = flag.Int("max-age-days", 60, "maximum age of objects in the cache in days; 0 means no limit")
+	maxAge  = flag.Int("max-age-hours", 12, "maximum age of objects in the cache in hours; 0 means no limit")
 
 	globalGeneration = flag.Int("global-generation", 1, "generation number of the global namespace; incrementing it effectively wipes the global namespace, with the old generation's objects aging out via normal LRU eviction")
 
@@ -74,7 +74,7 @@ func main() {
 		gocached.WithSQLiteDir(*sqliteDir),
 		gocached.WithVerbose(*verbose),
 		gocached.WithMaxSize(int64(*maxSize) << 30),
-		gocached.WithMaxAge(time.Duration(*maxAge) * 24 * time.Hour),
+		gocached.WithMaxAge(time.Duration(*maxAge) * time.Hour),
 		gocached.WithShardPrefixLen(*shardPrefixLen),
 		gocached.WithGlobalGeneration(*globalGeneration),
 	}

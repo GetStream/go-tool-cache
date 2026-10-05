@@ -1385,9 +1385,10 @@ func validHex(x string) bool {
 	return true
 }
 
-// relAtimeSeconds is how old an access time needs to be before
-// we do a DB write to update it.
-const relAtimeSeconds = 60 * 60 * 24 // 1 day
+// relAtimeSeconds is how old an access time needs to be before we do a DB
+// write to update it. It is half of the default 12 hour max age, so repeated
+// hits do not rewrite atime until an object is halfway to expiry.
+const relAtimeSeconds = 6 * 60 * 60 // 6 hours
 
 // getFromNamespace fetches an action row from the global namespace or the
 // session's one extra read namespace, preferring a hit in global so the shared
@@ -1668,7 +1669,7 @@ func (srv *Server) maybeBumpAccessTime(actionKey actionKey, priorAccessTimeUnixS
 	if priorAccessTimeUnixSec > now-relAtimeSeconds {
 		return false
 	}
-	// If it's been more than a day since the last access, update the access time.
+	// If the last access is older than relAtimeSeconds, update the access time.
 	// This is similar to the Linux "relatime" behavior.
 	return srv.enqueueAccessTimeBump(actionKey)
 }
@@ -2291,8 +2292,8 @@ type usageStats struct {
 	// there are map keys for 24h and 48h, the latter includes the sum of the
 	// 24h values as well.
 	//
-	// The map keys are day-granularity, as the access time is only updated once
-	// it's over a day old.
+	// The map keys are day-granularity. Access times are rewritten only once
+	// they are older than relAtimeSeconds (half the default 12 hour max age).
 	//
 	// So the map keys are 24h, 48h, 96h, 168h (7d), 336h (14d), 720h
 	// (30d), and 2160h (90d) and math.MaxInt64 for infinity.

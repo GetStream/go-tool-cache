@@ -474,8 +474,15 @@ func TestServer(t *testing.T) {
 
 	// Check that access time gets updated.
 	// Do it from a fresh client without a disk cache.
+	// Age objects past both the relatime bump threshold and the 48h usage
+	// cohort. The histogram assertion below expects unbumped actions to fall
+	// out of the 24h and 48h buckets.
 	st.wantMetric(&st.srv.m.GetAccessBumps, 0)
-	st.advanceClock(relAtimeSeconds * 2 * time.Second) // advance clock by 2 days
+	advance := 48 * time.Hour
+	if rel := relAtimeSeconds * 2 * time.Second; rel > advance {
+		advance = rel
+	}
+	st.advanceClock(advance)
 	c3 := st.mkClient()
 	st.wantGet(c3, testActionID, testOutputID, testObjectValue)
 	st.wantMetric(&st.srv.m.GetAccessBumps, 1)
@@ -502,7 +509,7 @@ func TestServer(t *testing.T) {
 		t.Errorf("usageStats mismatch (-got +want):\n%s", diff)
 	}
 
-	st.advanceClock(relAtimeSeconds * 2 * time.Second) // advance clock by 2 days
+	st.advanceClock(advance) // past relatime again; nothing asserts after this
 }
 
 // TestEvictionQueryPlan is the lockdown test for the eviction query: it

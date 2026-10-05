@@ -1385,10 +1385,17 @@ func validHex(x string) bool {
 	return true
 }
 
-// relAtimeSeconds is how old an access time needs to be before we do a DB
-// write to update it. It is half of the default 12 hour max age, so repeated
-// hits do not rewrite atime until an object is halfway to expiry.
-const relAtimeSeconds = 6 * 60 * 60 // 6 hours
+// relAtimeSeconds is how old an access time must be before a DB write updates
+// it. The threshold is half the configured max age, so -max-age-hours=12
+// waits 6 hours and any other max age waits half of that duration. Repeated
+// hits do not rewrite atime until an object is halfway to expiry. A max age
+// of 0 means no expiry, so there is no halfway point and the result is 0.
+func (srv *Server) relAtimeSeconds() int64 {
+	if srv.maxAge <= 0 {
+		return 0
+	}
+	return int64(srv.maxAge / time.Second / 2)
+}
 
 // getFromNamespace fetches an action row from the global namespace or the
 // session's one extra read namespace, preferring a hit in global so the shared
@@ -1665,11 +1672,17 @@ func (srv *Server) writeObjectResponse(w http.ResponseWriter, r *http.Request, s
 // given actionKey, if the provided prior access time (unix seconds) is old
 // enough to warrant an update.
 func (srv *Server) maybeBumpAccessTime(actionKey actionKey, priorAccessTimeUnixSec int64) (didBump bool) {
-	now := srv.now().Unix()
-	if priorAccessTimeUnixSec > now-relAtimeSeconds {
+	// Half the configured max age. Zero means max age is disabled (or shorter
+	// than 2 seconds); do not rewrite atime on every hit in that case.
+	threshold := srv.relAtimeSeconds()
+	if threshold <= 0 {
 		return false
 	}
-	// If the last access is older than relAtimeSeconds, update the access time.
+	now := srv.now().Unix()
+	if priorAccessTimeUnixSec > now-threshold {
+		return false
+	}
+	// Last access is older than half the max age. Update it.
 	// This is similar to the Linux "relatime" behavior.
 	return srv.enqueueAccessTimeBump(actionKey)
 }
@@ -2293,7 +2306,7 @@ type usageStats struct {
 	// 24h values as well.
 	//
 	// The map keys are day-granularity. Access times are rewritten only once
-	// they are older than relAtimeSeconds (half the default 12 hour max age).
+	// they are older than half the configured max age.
 	//
 	// So the map keys are 24h, 48h, 96h, 168h (7d), 336h (14d), 720h
 	// (30d), and 2160h (90d) and math.MaxInt64 for infinity.

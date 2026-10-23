@@ -52,6 +52,8 @@ type DiskCache struct {
 	closed bool
 
 	lockWaiters atomic.Int64
+
+	switchingToEX func() // test hook, called after Put releases SH and before it takes EX
 }
 
 func (dc *DiskCache) logf(format string, args ...any) {
@@ -380,18 +382,17 @@ func (dc *DiskCache) Put(ctx context.Context, actionID, outputID string, size in
 		return "", err
 	}
 
-	// Release SH before taking EX, then recheck because another process may
-	// have published the object while this process was switching lock modes.
-	lock, err = dc.acquireLock(ctx, outputFile+".lock", true)
+	// Release SH before taking EX. Another helper may publish the object while
+	// this process switches lock modes and then retain SH until it exits, so
+	// EX alone could wait for that helper's lifetime.
+	if dc.switchingToEX != nil {
+		dc.switchingToEX()
+	}
+	lock, f, err = dc.acquireForPublish(ctx, outputFile, size)
 	if err != nil {
 		return "", err
 	}
-	f, valid, err = openValidObject(outputFile, size)
-	if err != nil {
-		lock.close()
-		return "", err
-	}
-	if valid {
+	if f != nil {
 		if err := drainBody(body, size); err != nil {
 			f.Close()
 			lock.close()
@@ -418,6 +419,62 @@ func (dc *DiskCache) Put(ctx context.Context, actionID, outputID string, size in
 		}
 	}
 	return dc.finishPut(actionFile, outputFile, outputID, size, f, lock)
+}
+
+// acquireForPublish waits until it holds either EX on the object lock, or SH
+// with a valid object already published by another process. On SH the open
+// object is returned; on EX the object is rechecked and returned if valid.
+func (dc *DiskCache) acquireForPublish(ctx context.Context, outputFile string, size int64) (*fileLock, *os.File, error) {
+	lockPath := outputFile + ".lock"
+	if dc.LockTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, dc.LockTimeout)
+		defer cancel()
+	}
+
+	waiting := false
+	defer func() {
+		if waiting {
+			dc.lockWaiters.Add(-1)
+		}
+	}()
+
+	for {
+		for _, exclusive := range []bool{true, false} {
+			lock, acquired, err := acquireFileLock(lockPath, exclusive, true)
+			if err != nil {
+				return nil, nil, err
+			}
+			if !acquired {
+				continue
+			}
+			f, valid, err := openValidObject(outputFile, size)
+			if err != nil {
+				lock.close()
+				return nil, nil, err
+			}
+			if valid || exclusive {
+				return lock, f, nil
+			}
+			if err := lock.close(); err != nil {
+				return nil, nil, err
+			}
+		}
+		if !waiting {
+			waiting = true
+			dc.lockWaiters.Add(1)
+		}
+
+		timer := time.NewTimer(lockRetryInterval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return nil, nil, fmt.Errorf("acquiring cache object lock %s: %w", lockPath, ctx.Err())
+		case <-timer.C:
+		}
+	}
 }
 
 func drainBody(body io.Reader, size int64) error {

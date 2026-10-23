@@ -52,6 +52,8 @@ type DiskCache struct {
 	closed bool
 
 	lockWaiters atomic.Int64
+
+	switchingToEX func() // test hook, called after Put releases SH and before it takes EX
 }
 
 func (dc *DiskCache) logf(format string, args ...any) {
@@ -383,6 +385,9 @@ func (dc *DiskCache) Put(ctx context.Context, actionID, outputID string, size in
 	// Release SH before taking EX. Another helper may publish the object while
 	// this process switches lock modes and then retain SH until it exits, so
 	// EX alone could wait for that helper's lifetime.
+	if dc.switchingToEX != nil {
+		dc.switchingToEX()
+	}
 	lock, f, err = dc.acquireForPublish(ctx, outputFile, size)
 	if err != nil {
 		return "", err

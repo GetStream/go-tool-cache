@@ -22,23 +22,26 @@ func TestPutUsesObjectPublishedWhileSwitchingLockModes(t *testing.T) {
 	defer a.Close()
 	defer b.Close()
 
-	if _, err := a.Put(context.Background(), testActionA, testOutputA, int64(len(data)), bytes.NewReader(data)); err != nil {
-		t.Fatal(err)
+	// a publishes the object and retains SH while b switches from SH to EX.
+	b.switchingToEX = func() {
+		if _, err := a.Put(context.Background(), testActionA, testOutputA, int64(len(data)), bytes.NewReader(data)); err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	// b reaches the EX step after a published and retained SH on the object.
 	start := time.Now()
-	lock, f, err := b.acquireForPublish(context.Background(), b.OutputFilename(testOutputA), int64(len(data)))
+	path, err := b.Put(context.Background(), testActionB, testOutputA, int64(len(data)), bytes.NewReader(data))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer lock.close()
-	defer f.Close()
-	if f == nil {
-		t.Fatal("expected the published object")
-	}
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("waited %v for a lock retained by another helper", elapsed)
+	}
+	if path != b.OutputFilename(testOutputA) {
+		t.Fatalf("path = %q, want %q", path, b.OutputFilename(testOutputA))
+	}
+	if b.HeldCount() != 1 {
+		t.Fatalf("b holds %d objects, want 1", b.HeldCount())
 	}
 }
 

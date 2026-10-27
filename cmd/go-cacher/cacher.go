@@ -50,6 +50,7 @@ var (
 	interval    = flag.Duration("interval", 10*time.Minute, "base interval between sweep attempts")
 	jitter      = flag.Duration("jitter", 5*time.Minute, "maximum random delay added to each interval")
 	firstDelay  = flag.Duration("initial-delay", 5*time.Minute, "maximum randomized delay before the first sweep")
+	moduleIndex = flag.String("module-index", moduleIndexAuto, `where cmd/go module index entries are cached: "auto" (like any other action), "remote" (like any other action, including -cache-server) or "local" (local disk only); "local" needs a cmd/go that sends ActionKind`)
 )
 
 func main() {
@@ -62,6 +63,9 @@ func main() {
 	}
 	if *statusEvery <= 0 {
 		log.Fatal("-status-interval must be positive")
+	}
+	if err := validateModuleIndexMode(*moduleIndex); err != nil {
+		log.Fatal(err)
 	}
 	if *verbose {
 		log.Printf("go-cacher: verbose mode enabled")
@@ -190,6 +194,8 @@ func main() {
 			}
 		}
 	}
+
+	p.Get, p.Put = routeModuleIndex(*moduleIndex, p.Get, p.Put, dc.Get, dc.Put)
 
 	statusCtx, stopStatus := context.WithCancel(context.Background())
 	var statusWG sync.WaitGroup

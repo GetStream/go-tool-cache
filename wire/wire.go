@@ -17,6 +17,10 @@ import (
 // is absent and Prometheus series use action_kind="".
 const ActionKindHeader = "Go-Action-Kind"
 
+// ActionKindModuleIndex is the ActionKind of cmd/go's module index entries
+// (cache.NewHash("moduleIndex") in cmd/go/internal/modindex).
+const ActionKindModuleIndex = "moduleIndex"
+
 type actionKindContextKey struct{}
 
 // ContextWithActionKind returns a child context carrying a sanitized ActionKind.

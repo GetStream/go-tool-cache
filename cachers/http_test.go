@@ -551,3 +551,58 @@ func TestHTTPClientActionKindHeader(t *testing.T) {
 		t.Errorf("PUT Go-Action-Kind = %q, want compile", gotPut)
 	}
 }
+
+func TestHTTPClientModuleIndexLocal(t *testing.T) {
+	const (
+		testActionID = "aabbccdd"
+		testOutputID = "eeff0011"
+	)
+	for _, tc := range []struct {
+		name             string
+		moduleIndexLocal bool
+		kind             string
+		wantRequests     int32 // GET and PUT reaching the server
+	}{
+		{"local, module index", true, wire.ActionKindModuleIndex, 0},
+		{"local, other kind", true, "compile", 2},
+		{"local, no kind", true, "", 2},
+		{"default, module index", false, wire.ActionKindModuleIndex, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var requests atomic.Int32
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				io.Copy(io.Discard, r.Body)
+				if r.Method == "GET" {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer ts.Close()
+			hc := &HTTPClient{
+				BaseURL:          ts.URL,
+				Disk:             &DiskCache{Dir: t.TempDir()},
+				ModuleIndexLocal: tc.moduleIndexLocal,
+			}
+			ctx := wire.ContextWithActionKind(context.Background(), tc.kind)
+
+			outputID, _, err := hc.Get(ctx, testActionID)
+			if err != nil || outputID != "" {
+				t.Fatalf("Get = %q, %v; want a miss", outputID, err)
+			}
+			if _, err := hc.Put(ctx, testActionID, testOutputID, 4, bytes.NewReader([]byte("blob"))); err != nil {
+				t.Fatal(err)
+			}
+			if got := requests.Load(); got != tc.wantRequests {
+				t.Errorf("server got %d requests, want %d", got, tc.wantRequests)
+			}
+
+			// Put always writes local disk, so the entry is now a local hit.
+			outputID, _, err = hc.Get(ctx, testActionID)
+			if err != nil || outputID != testOutputID {
+				t.Fatalf("Get after Put = %q, %v; want %q", outputID, err, testOutputID)
+			}
+		})
+	}
+}

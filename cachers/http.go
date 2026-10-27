@@ -62,6 +62,13 @@ type HTTPClient struct {
 	// is set.
 	AsyncPutTimeout func(size int64) time.Duration
 
+	// ModuleIndexLocal, when true, keeps cmd/go's module index entries
+	// (ActionKind wire.ActionKindModuleIndex) on local disk: Get doesn't ask the
+	// server for them and Put doesn't upload them. Their key includes source
+	// file mtimes, so a fresh checkout misses them all, and each remote miss
+	// and upload is a round trip. Requests without ActionKind are unaffected.
+	ModuleIndexLocal bool
+
 	// AsyncPutMaxConcurrent, if positive, caps the number of background PUTs
 	// running at once. New PUTs beyond the cap are queued until an existing PUT
 	// finishes. Disk writes are not affected, and it only applies when
@@ -179,6 +186,9 @@ func (c *HTTPClient) Get(ctx context.Context, actionID string) (outputID, diskPa
 	outputID, diskPath, err = c.Disk.Get(ctx, actionID)
 	if err == nil && outputID != "" {
 		return outputID, diskPath, nil
+	}
+	if c.ModuleIndexLocal && wire.ActionKindFromContext(ctx) == wire.ActionKindModuleIndex {
+		return "", "", err
 	}
 
 	req, _ := http.NewRequestWithContext(ctx, "GET", c.BaseURL+"/action/"+actionID, nil)
@@ -318,6 +328,9 @@ func (c *HTTPClient) Put(ctx context.Context, actionID, outputID string, size in
 	if err != nil {
 		log.Printf("HTTPClient.Put local disk write error: %v", err)
 		return "", err
+	}
+	if c.ModuleIndexLocal && wire.ActionKindFromContext(ctx) == wire.ActionKindModuleIndex {
+		return diskPath, nil
 	}
 
 	kind := wire.ActionKindFromContext(ctx)

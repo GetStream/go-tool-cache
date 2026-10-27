@@ -8,7 +8,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync/atomic"
 	"testing"
+
+	"github.com/GetStream/go-tool-cache/wire"
 )
 
 func TestServerIndex(t *testing.T) {
@@ -262,5 +265,43 @@ func TestMultiHTTPClientSingleServer(t *testing.T) {
 	}
 	if !bytes.Equal(got, testData) {
 		t.Errorf("disk content = %q, want %q", got, testData)
+	}
+}
+
+func TestMultiHTTPClientModuleIndexLocal(t *testing.T) {
+	var requests atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ts.Close()
+	dc := &DiskCache{Dir: t.TempDir()}
+	clients := []*HTTPClient{
+		{BaseURL: ts.URL, Disk: dc, BestEffortHTTP: true, ModuleIndexLocal: true},
+		{BaseURL: ts.URL, Disk: dc, BestEffortHTTP: true, ModuleIndexLocal: true},
+	}
+	mc := &MultiHTTPClient{Clients: clients, Disk: dc}
+
+	ctx := wire.ContextWithActionKind(context.Background(), wire.ActionKindModuleIndex)
+	outputID, _, err := mc.Get(ctx, "aabbccdd")
+	if err != nil || outputID != "" {
+		t.Fatalf("Get = %q, %v; want a miss", outputID, err)
+	}
+	if _, err := mc.Put(ctx, "aabbccdd", "eeff0011", 4, bytes.NewReader([]byte("blob"))); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range clients {
+		c.Shutdown(context.Background())
+	}
+	if got := requests.Load(); got != 0 {
+		t.Errorf("servers got %d requests, want 0", got)
+	}
+
+	ctx = wire.ContextWithActionKind(context.Background(), "compile")
+	if _, _, err := mc.Get(ctx, "11223344"); err != nil {
+		t.Fatal(err)
+	}
+	if got := requests.Load(); got == 0 {
+		t.Error("compile Get didn't reach the servers")
 	}
 }

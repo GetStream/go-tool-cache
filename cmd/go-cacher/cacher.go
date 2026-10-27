@@ -50,7 +50,7 @@ var (
 	interval    = flag.Duration("interval", 10*time.Minute, "base interval between sweep attempts")
 	jitter      = flag.Duration("jitter", 5*time.Minute, "maximum random delay added to each interval")
 	firstDelay  = flag.Duration("initial-delay", 5*time.Minute, "maximum randomized delay before the first sweep")
-	moduleIndex = flag.String("module-index", moduleIndexAuto, `where cmd/go module index entries are cached: "auto" (like any other action), "remote" (like any other action, including -cache-server) or "local" (local disk only); "local" needs a cmd/go that sends ActionKind`)
+	moduleIndex = flag.String("module-index", "auto", `where to cache cmd/go's module index entries: "auto" or "remote" (like any other action) or "local" (local disk only, never -cache-server); "local" needs a cmd/go that sends ActionKind`)
 )
 
 func main() {
@@ -64,9 +64,12 @@ func main() {
 	if *statusEvery <= 0 {
 		log.Fatal("-status-interval must be positive")
 	}
-	if err := validateModuleIndexMode(*moduleIndex); err != nil {
-		log.Fatal(err)
+	switch *moduleIndex {
+	case "auto", "remote", "local":
+	default:
+		log.Fatalf(`-module-index must be "auto", "remote" or "local", got %q`, *moduleIndex)
 	}
+	moduleIndexLocal := *moduleIndex == "local"
 	if *verbose {
 		log.Printf("go-cacher: verbose mode enabled")
 	}
@@ -154,11 +157,12 @@ func main() {
 		}
 		if len(urls) == 1 {
 			hc = &cachers.HTTPClient{
-				BaseURL:     urls[0],
-				Disk:        dc,
-				HTTPClient:  remoteClient,
-				Verbose:     *verbose,
-				AccessToken: *token,
+				BaseURL:          urls[0],
+				Disk:             dc,
+				HTTPClient:       remoteClient,
+				Verbose:          *verbose,
+				AccessToken:      *token,
+				ModuleIndexLocal: moduleIndexLocal,
 			}
 			p.Get = hc.Get
 			p.Put = hc.Put
@@ -167,12 +171,13 @@ func main() {
 			clients := make([]*cachers.HTTPClient, len(urls))
 			for i, u := range urls {
 				clients[i] = &cachers.HTTPClient{
-					BaseURL:        u,
-					Disk:           dc,
-					HTTPClient:     remoteClient,
-					Verbose:        *verbose,
-					AccessToken:    *token,
-					BestEffortHTTP: true,
+					BaseURL:          u,
+					Disk:             dc,
+					HTTPClient:       remoteClient,
+					Verbose:          *verbose,
+					AccessToken:      *token,
+					BestEffortHTTP:   true,
+					ModuleIndexLocal: moduleIndexLocal,
 				}
 			}
 			mc := &cachers.MultiHTTPClient{
@@ -194,8 +199,6 @@ func main() {
 			}
 		}
 	}
-
-	p.Get, p.Put = routeModuleIndex(*moduleIndex, p.Get, p.Put, dc.Get, dc.Put)
 
 	statusCtx, stopStatus := context.WithCancel(context.Background())
 	var statusWG sync.WaitGroup
